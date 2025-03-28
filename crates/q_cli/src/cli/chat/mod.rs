@@ -96,6 +96,7 @@ const WELCOME_TEXT: &str = color_print::cstr! {"
 • Help me understand my git status
 
 <em>/acceptall</em>    <black!>Toggles acceptance prompting for the session.</black!>
+<em>/issue</em>        <black!>Report an issue or make a feature request.</black!>
 <em>/profile</em>      <black!>(Beta) Manage profiles for the chat session</black!>
 <em>/context</em>      <black!>(Beta) Manage context files for a profile</black!>
 <em>/help</em>         <black!>Show the help dialogue</black!>
@@ -110,6 +111,7 @@ const HELP_TEXT: &str = color_print::cstr! {"
 
 <em>/clear</em>        <black!>Clear the conversation history</black!>
 <em>/acceptall</em>    <black!>Toggles acceptance prompting for the session.</black!>
+<em>/issue</em>        <black!>Report an issue or make a feature request.</black!>
 <em>/help</em>         <black!>Show this help dialogue</black!>
 <em>/quit</em>         <black!>Quit the application</black!>
 <em>/profile</em>      <black!>Manage profiles</black!>
@@ -664,6 +666,17 @@ where
                 ChatState::PromptUser {
                     tool_uses: Some(tool_uses),
                     skip_printing_tools: true,
+                }
+            },
+            Command::Issue { prompt } => {
+                let input = "I would like to report an issue or make a feature request";
+                ChatState::HandleInput {
+                    input: if let Some(prompt) = prompt {
+                        format!("{input}: {prompt}")
+                    } else {
+                        input.to_string()
+                    },
+                    tool_uses: Some(tool_uses),
                 }
             },
             Command::AcceptAll => {

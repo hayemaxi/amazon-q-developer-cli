@@ -7,6 +7,7 @@ pub enum Command {
     Clear,
     Help,
     AcceptAll,
+    Issue { prompt: Option<String> },
     Quit,
     Profile { subcommand: ProfileSubcommand },
     Context { subcommand: ContextSubcommand },
@@ -163,6 +164,15 @@ impl Command {
                 "clear" => Self::Clear,
                 "help" => Self::Help,
                 "acceptall" => Self::AcceptAll,
+                "issue" => {
+                    if parts.len() > 1 {
+                        Self::Issue {
+                            prompt: Some(parts[1..].join(" ")),
+                        }
+                    } else {
+                        Self::Issue { prompt: None }
+                    }
+                },
                 "q" | "exit" | "quit" => Self::Quit,
                 "profile" => {
                     if parts.len() < 2 {
@@ -443,6 +453,13 @@ mod tests {
                 "/context clear --global",
                 context!(ContextSubcommand::Clear { global: true }),
             ),
+            ("/issue", Command::Issue { prompt: None }),
+            ("/issue there was an error in the chat", Command::Issue {
+                prompt: Some("there was an error in the chat".to_string()),
+            }),
+            ("/issue \"there was an error in the chat\"", Command::Issue {
+                prompt: Some("\"there was an error in the chat\"".to_string()),
+            }),
         ];
 
         for (input, parsed) in tests {
