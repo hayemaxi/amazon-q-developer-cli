@@ -195,6 +195,14 @@ pub enum CliRootCommands {
         /// Context profile to use
         #[arg(long = "profile")]
         profile: Option<String>,
+        /// Trust all tools to perform actions without confirmation (equivalent to deprecated
+        /// accept_all)
+        #[arg(long)]
+        trust_all_tools: bool,
+        /// Trust only this set of tools. Example: '--trust-tools=fs_read,fs_write' OR
+        /// to trust no tools, use '--trust-tools='
+        #[arg(long, value_delimiter = ',')]
+        trust_tools: Option<Vec<String>>,
     },
     /// Inline shell completions
     #[command(subcommand)]
@@ -344,11 +352,22 @@ impl Cli {
                     no_interactive,
                     input,
                     profile,
-                } => chat::chat(input, no_interactive, accept_all, profile).await,
+                    trust_all_tools,
+                    trust_tools,
+                } => {
+                    // `--trust-tools=` results in [""]
+                    let trust_tools = trust_tools.map(|mut tools| {
+                        if tools.len() == 1 && tools[0].is_empty() {
+                            tools.pop();
+                        }
+                        tools
+                    });
+                    chat::chat(input, no_interactive, accept_all, profile, trust_all_tools, trust_tools).await
+                },
                 CliRootCommands::Inline(subcommand) => subcommand.execute(&cli_context).await,
             },
             // Root command
-            None => chat::chat(None, false, false, None).await,
+            None => chat::chat(None, false, false, None, false, None).await,
         }
     }
 
@@ -468,6 +487,8 @@ mod test {
                 no_interactive: false,
                 input: None,
                 profile: None,
+                trust_all_tools: false,
+                trust_tools: None,
             },),
             verbose: 2,
             help_all: false,
@@ -598,6 +619,8 @@ mod test {
             no_interactive: false,
             input: None,
             profile: Some("my-profile".to_string()),
+            trust_all_tools: false,
+            trust_tools: None,
         });
     }
 
@@ -608,6 +631,8 @@ mod test {
             no_interactive: false,
             input: Some("Hello".to_string()),
             profile: Some("my-profile".to_string()),
+            trust_all_tools: false,
+            trust_tools: None,
         });
     }
 
@@ -620,6 +645,8 @@ mod test {
                 no_interactive: false,
                 input: None,
                 profile: Some("my-profile".to_string()),
+                trust_all_tools: false,
+                trust_tools: None,
             }
         );
     }
@@ -631,6 +658,44 @@ mod test {
             no_interactive: true,
             input: None,
             profile: None,
+            trust_all_tools: false,
+            trust_tools: None,
+        });
+    }
+
+    #[test]
+    fn test_chat_with_tool_trust_all() {
+        assert_parse!(["chat", "--trust-all-tools"], CliRootCommands::Chat {
+            accept_all: false,
+            no_interactive: false,
+            input: None,
+            profile: None,
+            trust_all_tools: true,
+            trust_tools: None,
+        });
+    }
+
+    #[test]
+    fn test_chat_with_tool_trust_none() {
+        assert_parse!(["chat", "--trust-tools="], CliRootCommands::Chat {
+            accept_all: false,
+            no_interactive: false,
+            input: None,
+            profile: None,
+            trust_all_tools: false,
+            trust_tools: Some(vec!["".to_string()]),
+        });
+    }
+
+    #[test]
+    fn test_chat_with_tool_trust_some() {
+        assert_parse!(["chat", "--trust-tools=fs_read,fs_write"], CliRootCommands::Chat {
+            accept_all: false,
+            no_interactive: false,
+            input: None,
+            profile: None,
+            trust_all_tools: false,
+            trust_tools: Some(vec!["fs_read".to_string(), "fs_write".to_string()]),
         });
     }
 }
