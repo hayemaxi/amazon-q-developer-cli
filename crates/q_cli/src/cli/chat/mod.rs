@@ -17,7 +17,10 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
-use command::Command;
+use command::{
+    Command,
+    ToolsSubcommand,
+};
 use context::ContextManager;
 use conversation_state::ConversationState;
 use crossterm::style::{
@@ -41,6 +44,7 @@ use fig_api_client::clients::SendMessageOutput;
 use fig_api_client::model::{
     AssistantResponseMessage,
     ChatResponseStream,
+    Tool as FigTool,
     ToolResult,
     ToolResultContentBlock,
     ToolResultStatus,
@@ -67,8 +71,7 @@ use tokio::signal::unix::{
 };
 use tools::gh_issue::GhIssueContext;
 use tools::{
-    Tool,
-    ToolSpec,
+    QueuedTool, Tool, ToolPermissions, ToolSpec
 };
 use tracing::{
     debug,
@@ -95,7 +98,7 @@ const WELCOME_TEXT: &str = color_print::cstr! {"
 • Write unit tests for my application.
 • Help me understand my git status
 
-<em>/acceptall</em>    <black!>Toggles acceptance prompting for the session.</black!>
+<em>/tools</em>        <black!>(Beta) View and manage tools and permissions.</black!>
 <em>/profile</em>      <black!>(Beta) Manage profiles for the chat session</black!>
 <em>/context</em>      <black!>(Beta) Manage context files for a profile</black!>
 <em>/help</em>         <black!>Show the help dialogue</black!>
@@ -109,9 +112,14 @@ const HELP_TEXT: &str = color_print::cstr! {"
 <magenta,em>q</magenta,em> (Amazon Q Chat)
 
 <em>/clear</em>        <black!>Clear the conversation history</black!>
-<em>/acceptall</em>    <black!>Toggles acceptance prompting for the session.</black!>
 <em>/help</em>         <black!>Show this help dialogue</black!>
 <em>/quit</em>         <black!>Quit the application</black!>
+<em>/tools</em>        <black!>View and manage tools and permissions.</black!>
+  <em>help</em>        <black!>Show an explanation for the trust command</black!>
+  <em>trust</em>       <black!>Trust a specific tool for the session</black!>
+  <em>untrust</em>     <black!>Revert a tool to per-request confirmation</black!>
+  <em>trustall</em>    <black!>Trust all tools (equivalent to deprecated /acceptall)</black!>
+  <em>reset</em>       <black!>Reset all tools to default permission levels</black!>
 <em>/profile</em>      <black!>Manage profiles</black!>
   <em>help</em>        <black!>Show profile help</black!>
   <em>list</em>        <black!>List profiles</black!>
@@ -256,11 +264,12 @@ pub struct ChatContext<W: Write> {
     spinner: Option<Spinner>,
     /// [ConversationState].
     conversation_state: ConversationState,
+    /// State to track tools that need confirmation.
+    tool_permissions: ToolPermissions,
     /// Telemetry events to be sent as part of the conversation.
     tool_use_telemetry_events: HashMap<String, ToolUseEventBuilder>,
     /// State used to keep track of tool use relation
     tool_use_status: ToolUseStatus,
-    accept_all: bool,
     /// Any failed requests that could be useful for error report/debugging
     failed_request_ids: Vec<String>,
 }
@@ -270,7 +279,7 @@ impl<W: Write> ChatContext<W> {
     pub async fn new(
         ctx: Arc<Context>,
         settings: Settings,
-        output: W,
+        mut output: W,
         input: Option<String>,
         input_source: InputSource,
         interactive: bool,
@@ -280,6 +289,21 @@ impl<W: Write> ChatContext<W> {
         profile: Option<String>,
     ) -> Result<Self> {
         let ctx_clone = Arc::clone(&ctx);
+        let tool_config = load_tools()?;
+        
+        let mut tool_permissions = ToolPermissions::new(tool_config.len());
+        if accept_all {
+            for tool in tool_config.values() {
+                tool_permissions.trust_tool(&tool.name);
+            }
+
+            if interactive {
+                queue!(output, 
+                    style::Print("/accept-all is deprecated. Use /tools instead.")
+                )?;
+            }
+        }
+
         Ok(Self {
             ctx,
             settings,
@@ -290,10 +314,10 @@ impl<W: Write> ChatContext<W> {
             client,
             terminal_width_provider,
             spinner: None,
-            conversation_state: ConversationState::new(ctx_clone, load_tools()?, profile).await,
+            tool_permissions,
+            conversation_state: ConversationState::new(ctx_clone, tool_config, profile).await,
             tool_use_telemetry_events: HashMap::new(),
             tool_use_status: ToolUseStatus::Idle,
-            accept_all,
             failed_request_ids: Vec::new(),
         })
     }
@@ -320,9 +344,6 @@ impl<W: Write> Drop for ChatContext<W> {
     }
 }
 
-/// An executable `(tool_use_id, Tool)` tuple.
-type QueuedTool = (String, Tool);
-
 /// The chat execution state.
 ///
 /// Intended to provide more robust handling around state transitions while dealing with, e.g.,
@@ -333,12 +354,15 @@ enum ChatState {
     PromptUser {
         /// Tool uses to present to the user.
         tool_uses: Option<Vec<QueuedTool>>,
+        pending_tool_index: Option<usize>,
+        /// Used to avoid displaying the tool info at inappropriate times, e.g. after clear or help commands.
         skip_printing_tools: bool,
     },
     /// Handle the user input, depending on if any tools require execution.
     HandleInput {
         input: String,
         tool_uses: Option<Vec<QueuedTool>>,
+        pending_tool_index: Option<usize>,
     },
     /// Validate the list of tool uses provided by the model.
     ValidateTools(Vec<ToolUse>),
@@ -354,6 +378,7 @@ impl Default for ChatState {
     fn default() -> Self {
         Self::PromptUser {
             tool_uses: None,
+            pending_tool_index: None,
             skip_printing_tools: false,
         }
     }
@@ -372,6 +397,7 @@ where
 
         let mut next_state = Some(ChatState::PromptUser {
             tool_uses: None,
+            pending_tool_index: None,
             skip_printing_tools: true,
         });
 
@@ -389,6 +415,7 @@ where
             next_state = Some(ChatState::HandleInput {
                 input: user_input,
                 tool_uses: None,
+                pending_tool_index: None,
             });
         }
 
@@ -403,15 +430,16 @@ where
             let result = match chat_state {
                 ChatState::PromptUser {
                     tool_uses,
+                    pending_tool_index,
                     skip_printing_tools,
                 } => {
                     // Cannot prompt in non-interactive mode no matter what.
                     if !self.interactive {
                         return Ok(());
                     }
-                    self.prompt_user(tool_uses, skip_printing_tools).await
+                    self.prompt_user(tool_uses, pending_tool_index, skip_printing_tools).await
                 },
-                ChatState::HandleInput { input, tool_uses } => self.handle_input(input, tool_uses).await,
+                ChatState::HandleInput { input, tool_uses, pending_tool_index } => self.handle_input(input, tool_uses, pending_tool_index).await,
                 ChatState::ExecuteTools(tool_uses) => {
                     let tool_uses_clone = tool_uses.clone();
                     tokio::select! {
@@ -481,9 +509,9 @@ where
                             execute!(self.output, style::Print("\n\n"))?;
                             // If there was an interrupt during tool execution, then we add fake
                             // messages to "reset" the chat state.
-                            if let Some(ref tool_uses) = inter {
+                            if let Some(tool_uses) = inter {
                                 self.conversation_state.abandon_tool_use(
-                                    tool_uses.clone(),
+                                    tool_uses,
                                     "The user interrupted the tool execution.".to_string(),
                                 );
                                 let _ = self.conversation_state.as_sendable_conversation_state().await;
@@ -518,6 +546,7 @@ where
                     self.conversation_state.fix_history();
                     next_state = Some(ChatState::PromptUser {
                         tool_uses: None,
+                        pending_tool_index: None,
                         skip_printing_tools: false,
                     });
                 },
@@ -529,27 +558,33 @@ where
     async fn prompt_user(
         &mut self,
         mut tool_uses: Option<Vec<QueuedTool>>,
+        pending_tool_index: Option<usize>,
         skip_printing_tools: bool,
     ) -> Result<ChatState, ChatError> {
         execute!(self.output, cursor::Show)?;
         let tool_uses = tool_uses.take().unwrap_or_default();
-        if !tool_uses.is_empty() && !skip_printing_tools {
-            self.print_tool_descriptions(&tool_uses).await?;
 
+        if !skip_printing_tools && pending_tool_index.is_some() {
             execute!(
                 self.output,
                 style::SetForegroundColor(Color::DarkGrey),
-                style::Print("\nEnter "),
+                style::Print("\nAllow this action? Use '"),
+                style::SetForegroundColor(Color::Green),
+                style::Print("t"),
+                style::SetForegroundColor(Color::DarkGrey),
+                style::Print("' to trust this tool for the session. ["),
                 style::SetForegroundColor(Color::Green),
                 style::Print("y"),
                 style::SetForegroundColor(Color::DarkGrey),
-                style::Print(format!(
-                    " to run {}, otherwise continue chatting.\n\n",
-                    match tool_uses.len() == 1 {
-                        true => "this tool",
-                        false => "these tools",
-                    }
-                )),
+                style::Print("/"),
+                style::SetForegroundColor(Color::Green),
+                style::Print("n"),
+                style::SetForegroundColor(Color::DarkGrey),
+                style::Print("/"),
+                style::SetForegroundColor(Color::Green),
+                style::Print("t"),
+                style::SetForegroundColor(Color::DarkGrey),
+                style::Print("]:\n\n"),
                 style::SetForegroundColor(Color::Reset),
             )?;
         }
@@ -580,6 +615,7 @@ where
         Ok(ChatState::HandleInput {
             input: user_input,
             tool_uses: Some(tool_uses),
+            pending_tool_index
         })
     }
 
@@ -587,8 +623,9 @@ where
         &mut self,
         user_input: String,
         tool_uses: Option<Vec<QueuedTool>>,
+        pending_tool_index: Option<usize>,
     ) -> Result<ChatState, ChatError> {
-        let command_result = Command::parse(&user_input);
+        let command_result = Command::parse(&user_input, &mut self.output);
 
         if let Err(error_message) = &command_result {
             // Display error message for command parsing errors
@@ -601,18 +638,32 @@ where
 
             return Ok(ChatState::PromptUser {
                 tool_uses,
+                pending_tool_index,
                 skip_printing_tools: true,
             });
         }
 
         let command = command_result.unwrap();
-        let tool_uses = tool_uses.unwrap_or_default();
+        let mut tool_uses: Vec<QueuedTool> = tool_uses.unwrap_or_default();
+
         Ok(match command {
             Command::Ask { prompt } => {
-                if ["y", "Y"].contains(&prompt.as_str()) && !tool_uses.is_empty() {
-                    return Ok(ChatState::ExecuteTools(tool_uses));
+                // Check for a pending tool approval
+                if let Some(index) = pending_tool_index {
+                    let tool_use = &mut tool_uses[index];
+
+                    let is_trust = prompt.as_str().eq("t");
+                    if ["y", "Y"].contains(&prompt.as_str()) || is_trust {
+                        if is_trust {
+                            self.tool_permissions.trust_tool(&tool_use.name);
+                        }
+                        tool_use.accepted = true;
+
+                        return Ok(ChatState::ExecuteTools(tool_uses));
+                    }
                 }
 
+                // Otherwise continue with normal chat on 'n' or other responses
                 self.tool_use_status = ToolUseStatus::Idle;
                 if self.interactive {
                     queue!(self.output, style::SetForegroundColor(Color::Magenta))?;
@@ -622,10 +673,10 @@ where
                     self.spinner = Some(Spinner::new(Spinners::Dots, "Thinking...".to_owned()));
                 }
 
-                if tool_uses.is_empty() {
-                    self.conversation_state.append_new_user_message(user_input).await;
-                } else {
+                if pending_tool_index.is_some() {
                     self.conversation_state.abandon_tool_use(tool_uses, user_input);
+                } else {
+                    self.conversation_state.append_new_user_message(user_input).await;
                 }
 
                 self.send_tool_use_telemetry().await;
@@ -642,6 +693,7 @@ where
                 queue!(self.output, style::Print('\n'))?;
                 ChatState::PromptUser {
                     tool_uses: None,
+                    pending_tool_index: None,
                     skip_printing_tools: false,
                 }
             },
@@ -657,6 +709,7 @@ where
 
                 ChatState::PromptUser {
                     tool_uses: None,
+                    pending_tool_index: None,
                     skip_printing_tools: true,
                 }
             },
@@ -664,25 +717,7 @@ where
                 execute!(self.output, style::Print(HELP_TEXT))?;
                 ChatState::PromptUser {
                     tool_uses: Some(tool_uses),
-                    skip_printing_tools: true,
-                }
-            },
-            Command::AcceptAll => {
-                self.accept_all = !self.accept_all;
-
-                execute!(
-                    self.output,
-                    style::SetForegroundColor(Color::Green),
-                    style::Print(format!("\n{}\n\n", match self.accept_all {
-                        true =>
-                            "Disabled acceptance prompting.\nAgents can sometimes do unexpected things so understand the risks.",
-                        false => "Enabled acceptance prompting. Run again to disable.",
-                    })),
-                    style::SetForegroundColor(Color::Reset)
-                )?;
-
-                ChatState::PromptUser {
-                    tool_uses: Some(tool_uses),
+                    pending_tool_index,
                     skip_printing_tools: true,
                 }
             },
@@ -804,6 +839,7 @@ where
                 }
                 ChatState::PromptUser {
                     tool_uses: Some(tool_uses),
+                    pending_tool_index,
                     skip_printing_tools: true,
                 }
             },
@@ -990,30 +1026,177 @@ where
 
                 ChatState::PromptUser {
                     tool_uses: Some(tool_uses),
+                    pending_tool_index,
+                    skip_printing_tools: true,
+                }
+            },
+            Command::Tools { subcommand } => {
+                match subcommand {
+                    Some(ToolsSubcommand::Trust { tool_name }) => {
+                        self.tool_permissions.untrust_tool(&tool_name);
+                        queue!(
+                            self.output,
+                            style::SetForegroundColor(Color::Green),
+                            style::Print(format!("\nTool '{tool_name}' is now trusted. I will ")),
+                            style::SetAttribute(Attribute::Bold),
+                            style::Print("not"),
+                            style::SetAttribute(Attribute::Reset),
+                            style::SetForegroundColor(Color::Green),
+                            style::Print(" ask for confirmation before running this tool."),
+                            style::SetForegroundColor(Color::Reset),
+                        )?;
+                    },
+                    Some(ToolsSubcommand::Untrust { tool_name }) => {
+                        self.tool_permissions.untrust_tool(&tool_name);
+                        queue!(
+                            self.output,
+                            style::SetForegroundColor(Color::Green),
+                            style::Print(format!("\nTool '{tool_name}' set to per-request confirmation."),),
+                            style::SetForegroundColor(Color::Reset),
+                        )?;
+                    },
+                    Some(ToolsSubcommand::TrustAll) => {
+                        self.conversation_state
+                            .tools
+                            .iter()
+                            .for_each(|FigTool::ToolSpecification(spec)| {
+                                self.tool_permissions.trust_tool(spec.name.as_str());
+                            });
+                            queue!(
+                            self.output,
+                            style::SetForegroundColor(Color::Green),
+                            style::Print("\nAll tools are now trusted. I will "),
+                            style::SetAttribute(Attribute::Bold),
+                            style::Print("not"),
+                            style::SetAttribute(Attribute::Reset),
+                            style::SetForegroundColor(Color::Green),
+                            style::Print(" ask for confirmation before running any tools."),
+                            style::SetForegroundColor(Color::Reset),
+                        )?;
+                    },
+                    Some(ToolsSubcommand::Reset) => {
+                        self.tool_permissions.reset();
+                        queue!(
+                            self.output,
+                            style::SetForegroundColor(Color::Green),
+                            style::Print("\nReset all tools to the default permission levels."),
+                            style::SetForegroundColor(Color::Reset),
+                        )?;
+                    },
+                    Some(ToolsSubcommand::Help) => {
+                        queue!(
+                            self.output,
+                            style::Print("\n"),
+                            style::Print(command::ToolsSubcommand::help_text()),
+                        )?;
+                    },
+                    None => {
+                        // No subcommand - print the current tools and their permissions.
+
+                        // Determine how to format the output nicely.
+                        let longest = self
+                            .conversation_state
+                            .tools
+                            .iter()
+                            .map(|FigTool::ToolSpecification(spec)| spec.name.len())
+                            .max()
+                            .unwrap_or(0);
+
+                        let tool_permissions: Vec<String> = self
+                            .conversation_state
+                            .tools
+                            .iter()
+                            .map(|FigTool::ToolSpecification(spec)| {
+                                let width = longest - spec.name.len() + 4;
+                                format!(
+                                    "- {}{:>width$}{}",
+                                    spec.name,
+                                    "",
+                                    self.tool_permissions.display_label(&spec.name),
+                                    width = width
+                                )
+                            })
+                            .collect();
+
+                        queue!(
+                            self.output,
+                            style::SetForegroundColor(Color::Green),
+                            style::Print("\nCurrent tool permissions:"),
+                            style::SetForegroundColor(Color::Reset),
+                            style::Print(format!("\n{}\n", tool_permissions.join("\n"))),
+                            style::SetForegroundColor(Color::Green),
+                            style::Print("\nUse /tools help to edit permissions."),
+                            style::SetForegroundColor(Color::Reset),
+                        )?;
+                    }
+                };
+
+                // Put spacing between previous output as to not be overwritten by
+                // during PromptUser.
+                execute!(
+                    self.output,
+                    style::Print("\n\n"),
+                )?;
+
+                ChatState::PromptUser {
+                    tool_uses: Some(tool_uses),
+                    pending_tool_index,
                     skip_printing_tools: true,
                 }
             },
         })
     }
 
-    async fn tool_use_execute(&mut self, tool_uses: Vec<QueuedTool>) -> Result<ChatState, ChatError> {
+    async fn tool_use_execute(&mut self, mut tool_uses: Vec<QueuedTool>) -> Result<ChatState, ChatError> {
+        // Verify tools have permissions.
+        for (index, tool) in tool_uses.iter_mut().enumerate() {
+            // Manually accepted by the user.
+            if tool.accepted {
+                continue;
+            }
+
+            self.print_tool_description(tool).await?;
+            let allowed = if self.tool_permissions.has(&tool.name) {
+                self.tool_permissions.is_trusted(&tool.name)
+            } else {
+                !tool.tool.requires_acceptance(&self.ctx)
+            };
+
+            if allowed { 
+                tool.accepted = true;
+                continue;
+            }
+
+            let pending_tool_index = Some(index);
+            if !self.interactive {
+                return Err(ChatError::NonInteractiveToolApproval);
+            }
+
+            return Ok(ChatState::PromptUser {
+                tool_uses: Some(tool_uses),
+                pending_tool_index: pending_tool_index,
+                skip_printing_tools: false,
+            })
+        }
+
         // Execute the requested tools.
         let terminal_width = self.terminal_width();
         let mut tool_results = vec![];
+
         for tool in tool_uses {
-            let mut tool_telemetry = self.tool_use_telemetry_events.entry(tool.0.clone());
+            let mut tool_telemetry = self.tool_use_telemetry_events.entry(tool.id.clone());
             tool_telemetry = tool_telemetry.and_modify(|ev| ev.is_accepted = true);
 
             let tool_start = std::time::Instant::now();
             queue!(
                 self.output,
                 style::SetForegroundColor(Color::Cyan),
-                style::Print(format!("\n{}...\n", tool.1.display_name_action())),
+                style::Print(format!("\n{}...\n", tool.tool.display_name_action())),
                 style::SetForegroundColor(Color::DarkGrey),
                 style::Print(format!("{}\n", "▔".repeat(terminal_width))),
                 style::SetForegroundColor(Color::Reset),
             )?;
-            let invoke_result = tool.1.invoke(&self.ctx, &mut self.output).await;
+            let invoke_result = tool.tool.invoke(&self.ctx, &mut self.output).await;
 
             if self.interactive && self.spinner.is_some() {
                 queue!(
@@ -1041,7 +1224,7 @@ where
 
                     tool_telemetry.and_modify(|ev| ev.is_success = Some(true));
                     tool_results.push(ToolResult {
-                        tool_use_id: tool.0,
+                        tool_use_id: tool.id,
                         content: vec![result.into()],
                         status: ToolResultStatus::Success,
                     });
@@ -1062,7 +1245,7 @@ where
 
                     tool_telemetry.and_modify(|ev| ev.is_success = Some(false));
                     tool_results.push(ToolResult {
-                        tool_use_id: tool.0,
+                        tool_use_id: tool.id,
                         content: vec![ToolResultContentBlock::Text(format!(
                             "An error occurred processing the tool: \n{}",
                             &err
@@ -1079,6 +1262,8 @@ where
                 },
             }
         }
+
+        tool_results.push(tool_results[0].clone());
 
         self.conversation_state.add_tool_results(tool_results);
         self.send_tool_use_telemetry().await;
@@ -1289,10 +1474,13 @@ where
         }
 
         if !tool_uses.is_empty() {
+            // let cloned = tool_uses[0].clone();
+            // tool_uses.push(cloned);
             Ok(ChatState::ValidateTools(tool_uses))
         } else {
             Ok(ChatState::PromptUser {
                 tool_uses: None,
+                pending_tool_index: None,
                 skip_printing_tools: false,
             })
         }
@@ -1302,9 +1490,11 @@ where
         let conv_id = self.conversation_state.conversation_id().to_owned();
         debug!(?tool_uses, "Validating tool uses");
         let mut queued_tools: Vec<QueuedTool> = Vec::new();
-        let mut tool_results = Vec::new();
+        let mut tool_results: Vec<ToolResult> = Vec::new();
+
         for tool_use in tool_uses {
             let tool_use_id = tool_use.id.clone();
+            let tool_use_name = tool_use.name.clone();
             let mut tool_telemetry = ToolUseEventBuilder::new(conv_id.clone(), tool_use.id.clone())
                 .set_tool_use_id(tool_use_id.clone())
                 .set_tool_name(tool_use.name.clone())
@@ -1317,7 +1507,12 @@ where
                     match tool.validate(&self.ctx).await {
                         Ok(()) => {
                             tool_telemetry.is_valid = Some(true);
-                            queued_tools.push((tool_use_id.clone(), tool));
+                            queued_tools.push(QueuedTool {
+                                id: tool_use_id.clone(),
+                                name: tool_use_name,
+                                tool,
+                                accepted: false,
+                            });
                         },
                         Err(err) => {
                             tool_telemetry.is_valid = Some(false);
@@ -1382,19 +1577,10 @@ where
             return Ok(ChatState::HandleResponseStream(response));
         }
 
-        let skip_acceptance = self.accept_all || queued_tools.iter().all(|tool| !tool.1.requires_acceptance(&self.ctx));
-
-        match (skip_acceptance, self.interactive) {
-            (true, _) => {
-                self.print_tool_descriptions(&queued_tools).await?;
-                Ok(ChatState::ExecuteTools(queued_tools))
-            },
-            (false, true) => Ok(ChatState::PromptUser {
-                tool_uses: Some(queued_tools),
-                skip_printing_tools: false,
-            }),
-            (false, false) => Err(ChatError::NonInteractiveToolApproval),
-        }
+        // for t in queued_tools.iter() {
+        //     self.print_tool_description(t).await?;
+        // }
+        Ok(ChatState::ExecuteTools(queued_tools))
     }
 
     /// Apply program context to tools that Q may not have.
@@ -1418,23 +1604,21 @@ where
         };
     }
 
-    async fn print_tool_descriptions(&mut self, tool_uses: &[QueuedTool]) -> Result<(), ChatError> {
+    async fn print_tool_description(&mut self, tool_use: &QueuedTool) -> Result<(), ChatError> {
         let terminal_width = self.terminal_width();
-        for (_, tool) in tool_uses.iter() {
-            queue!(
-                self.output,
-                style::SetForegroundColor(Color::Cyan),
-                style::Print(format!("{}\n", tool.display_name())),
-                style::SetForegroundColor(Color::Reset),
-                style::SetForegroundColor(Color::DarkGrey),
-                style::Print(format!("{}\n", "▔".repeat(terminal_width))),
-                style::SetForegroundColor(Color::Reset),
-            )?;
-            tool.queue_description(&self.ctx, &mut self.output)
-                .await
-                .map_err(|e| ChatError::Custom(format!("failed to print tool: {}", e).into()))?;
-            queue!(self.output, style::Print("\n"))?;
-        }
+        queue!(
+            self.output,
+            style::SetForegroundColor(Color::Cyan),
+            style::Print(format!("{}\n", tool_use.tool.display_name())),
+            style::SetForegroundColor(Color::Reset),
+            style::SetForegroundColor(Color::DarkGrey),
+            style::Print(format!("{}\n", "▔".repeat(terminal_width))),
+            style::SetForegroundColor(Color::Reset),
+        )?;
+        tool_use.tool.queue_description(&self.ctx, &mut self.output)
+            .await
+            .map_err(|e| ChatError::Custom(format!("failed to print tool: {}", e).into()))?;
+        queue!(self.output, style::Print("\n"))?;
         Ok(())
     }
 

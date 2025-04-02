@@ -4,6 +4,7 @@ pub mod fs_write;
 pub mod gh_issue;
 pub mod use_aws;
 
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::{
     Path,
@@ -142,6 +143,57 @@ impl TryFrom<ToolUse> for Tool {
     }
 }
 
+#[derive(Debug, Clone)]
+struct ToolPermission {
+    trusted: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct ToolPermissions {
+    permissions: HashMap<String, ToolPermission>,
+}
+
+impl ToolPermissions {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            permissions: HashMap::with_capacity(capacity),
+        }
+    }
+
+    pub fn is_trusted(&self, tool_name: &str) -> bool {
+        self.permissions
+            .get(tool_name)
+            .map(|perm| perm.trusted)
+            .unwrap_or(false)
+    }
+
+    pub fn display_label(&self, tool_name: &str) -> &str {
+        if self.is_trusted(tool_name) {
+            "Trusted"
+        } else {
+            "Per-request"
+        }
+    }
+
+    pub fn trust_tool(&mut self, tool_name: &str) {
+        self.permissions
+            .insert(tool_name.to_string(), ToolPermission { trusted: true });
+    }
+
+    pub fn untrust_tool(&mut self, tool_name: &str) {
+        self.permissions
+            .insert(tool_name.to_string(), ToolPermission { trusted: false });
+    }
+
+    pub fn reset(&mut self) {
+        self.permissions.clear();
+    }
+
+    pub fn has(&self, tool_name: &str) -> bool {
+        self.permissions.contains_key(tool_name)
+    }
+}
+
 /// A tool specification to be sent to the model as part of a conversation. Maps to
 /// [BedrockToolSpecification].
 #[derive(Debug, Clone, Deserialize)]
@@ -149,6 +201,14 @@ pub struct ToolSpec {
     pub name: String,
     pub description: String,
     pub input_schema: InputSchema,
+}
+
+#[derive(Debug, Clone)]
+pub struct QueuedTool {
+    pub id: String,
+    pub name: String,
+    pub accepted: bool,
+    pub tool: Tool,
 }
 
 /// The schema specification describing a tool's fields.
