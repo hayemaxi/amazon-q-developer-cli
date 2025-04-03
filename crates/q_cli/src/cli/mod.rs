@@ -182,8 +182,8 @@ pub enum CliRootCommands {
     /// AI assistant in your terminal
     #[command(alias("q"))]
     Chat {
-        /// Enabling this flag allows the model to execute all commands without first accepting
-        /// them.
+        /// (Deprecated, use --trust-all-tools) Enabling this flag allows the model to execute
+        /// all commands without first accepting them.
         #[arg(short, long)]
         accept_all: bool,
         /// Print the first response to STDOUT without interactive mode. This will fail if the
@@ -195,13 +195,12 @@ pub enum CliRootCommands {
         /// Context profile to use
         #[arg(long = "profile")]
         profile: Option<String>,
-        /// Trust all tools to perform actions without confirmation (equivalent to deprecated
-        /// accept_all)
+        /// Allows the model to use any tool to run commands without asking for confirmation.
         #[arg(long)]
         trust_all_tools: bool,
-        /// Trust only this set of tools. Example: '--trust-tools=fs_read,fs_write' OR
-        /// to trust no tools, use '--trust-tools='
-        #[arg(long, value_delimiter = ',')]
+        /// Trust only this set of tools. Example: trust some tools: '--trust-tools=fs_read,fs_write',
+        /// trust no tools: '--trust-tools='
+        #[arg(long, value_delimiter = ',', value_name="TOOL_NAMES")]
         trust_tools: Option<Vec<String>>,
     },
     /// Inline shell completions
