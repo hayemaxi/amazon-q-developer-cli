@@ -198,9 +198,9 @@ pub enum CliRootCommands {
         /// Allows the model to use any tool to run commands without asking for confirmation.
         #[arg(long)]
         trust_all_tools: bool,
-        /// Trust only this set of tools. Example: trust some tools: '--trust-tools=fs_read,fs_write',
-        /// trust no tools: '--trust-tools='
-        #[arg(long, value_delimiter = ',', value_name="TOOL_NAMES")]
+        /// Trust only this set of tools. Example: trust some tools:
+        /// '--trust-tools=fs_read,fs_write', trust no tools: '--trust-tools='
+        #[arg(long, value_delimiter = ',', value_name = "TOOL_NAMES")]
         trust_tools: Option<Vec<String>>,
     },
     /// Inline shell completions
