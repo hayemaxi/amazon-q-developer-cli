@@ -144,7 +144,7 @@ pub enum ToolsSubcommand {
 
 impl ToolsSubcommand {
     const AVAILABLE_COMMANDS: &str = color_print::cstr! {"<cyan!>Available subcommands</cyan!>
-  <em>help</em>                           <black!>Show an explanation for the trust command</black!>
+  <em>help</em>                           <black!>Show an explanation for the tools command</black!>
   <em>trust <<tool name>></em>              <black!>Trust a specific tool for the session</black!>
   <em>untrust <<tool name>></em>            <black!>Revert a tool to per-request confirmation</black!>
   <em>trustall</em>                       <black!>Trust all tools (equivalent to deprecated /acceptall)</black!>
