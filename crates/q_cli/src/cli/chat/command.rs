@@ -171,7 +171,7 @@ impl ToolsSubcommand {
             r#"
 <magenta,em>Tool Permissions</magenta,em>
 
-By default, Amazon Q will ask for your permission to certain tools. You can control which tools you
+By default, Amazon Q will ask for your permission to use certain tools. You can control which tools you
 trust so that no confirmation is required. These settings will last only for this session.
 
 {}
