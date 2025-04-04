@@ -104,8 +104,8 @@ const WELCOME_TEXT: &str = color_print::cstr! {"
 • Write unit tests for my application.
 • Help me understand my git status
 
-<em>/tools</em>        <black!>View and manage tools and permissions.</black!>
-<em>/issue</em>        <black!>Report an issue or make a feature request.</black!>
+<em>/tools</em>        <black!>View and manage tools and permissions</black!>
+<em>/issue</em>        <black!>Report an issue or make a feature request</black!>
 <em>/profile</em>      <black!>(Beta) Manage profiles for the chat session</black!>
 <em>/context</em>      <black!>(Beta) Manage context files for a profile</black!>
 <em>/help</em>         <black!>Show the help dialogue</black!>
@@ -121,10 +121,10 @@ const HELP_TEXT: &str = color_print::cstr! {"
 
 <cyan,em>Commands:</cyan,em>
 <em>/clear</em>        <black!>Clear the conversation history</black!>
-<em>/issue</em>        <black!>Report an issue or make a feature request.</black!>
+<em>/issue</em>        <black!>Report an issue or make a feature request</black!>
 <em>/help</em>         <black!>Show this help dialogue</black!>
 <em>/quit</em>         <black!>Quit the application</black!>
-<em>/tools</em>        <black!>View and manage tools and permissions.</black!>
+<em>/tools</em>        <black!>View and manage tools and permissions</black!>
   <em>help</em>        <black!>Show an explanation for the trust command</black!>
   <em>trust</em>       <black!>Trust a specific tool for the session</black!>
   <em>untrust</em>     <black!>Revert a tool to per-request confirmation</black!>
