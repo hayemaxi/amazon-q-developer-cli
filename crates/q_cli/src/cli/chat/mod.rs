@@ -677,8 +677,12 @@ where
         // Require two consecutive sigint's to exit.
         let mut ctrl_c = false;
         let user_input = loop {
-            // Generate prompt based on active context profile
-            let prompt = prompt::generate_prompt(self.conversation_state.current_profile());
+            let all_tools_trusted = self.conversation_state.tools.iter().all(|t| match t {
+                FigTool::ToolSpecification(t) => self.tool_permissions.is_trusted(&t.name),
+            });
+
+            // Generate prompt based on active context profile and trusted tools
+            let prompt = prompt::generate_prompt(self.conversation_state.current_profile(), all_tools_trusted);
 
             match (self.input_source.read_line(Some(&prompt))?, ctrl_c) {
                 (Some(line), _) => {
