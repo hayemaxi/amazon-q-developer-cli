@@ -1,8 +1,10 @@
+use std::collections::HashMap;
 use std::path::{
     Path,
     PathBuf,
 };
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use eyre::{
     Result,
@@ -17,13 +19,61 @@ use serde::{
     Serialize,
 };
 
+use crate::cli::chat::hooks::HookConfig;
+
+use super::hooks::{Hook, HookType};
+use super::tools::execute_bash::run_command;
+
 pub const AMAZONQ_FILENAME: &str = "AmazonQ.md";
+
+
+#[derive(Debug, Clone)]
+struct HookCache {
+    conversation_start: HashMap<String, (String, Instant)>,
+    per_prompt: HashMap<String, (String, Instant)>,
+}
+
+impl HookCache {
+    fn new() -> Self {
+        Self {
+            conversation_start: HashMap::new(),
+            per_prompt: HashMap::new(),
+        }
+    }
+
+    fn get(&self, name: &str, conversation_start: bool) -> Option<&String> {
+        let cache = if conversation_start {
+            &self.conversation_start
+        } else {
+            &self.per_prompt
+        };
+
+        cache.get(name).and_then(|(value, expiry)| {
+            if Instant::now() < *expiry {
+                Some(value)
+            } else {
+                None
+            }
+        })
+    }
+
+    fn insert(&mut self, name: &str, conversation_start: bool, output: String, expiry: Instant) {
+        let cache = if conversation_start {
+            &mut self.conversation_start
+        } else {
+            &mut self.per_prompt
+        };
+
+        cache.insert(name.to_string(), (output, expiry));
+    }
+}
 
 /// Configuration for context files, containing paths to include in the context.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ContextConfig {
     /// List of file paths or glob patterns to include in the context.
-    pub paths: Vec<String>,
+    pub paths: Option<Vec<String>>,
+    pub hooks: Option<HookConfig>,
 }
 
 #[allow(dead_code)]
@@ -40,6 +90,8 @@ pub struct ContextManager {
 
     /// Context configuration for the current profile.
     pub profile_config: ContextConfig,
+
+    hook_cache: HookCache,
 }
 
 #[allow(dead_code)]
@@ -67,6 +119,7 @@ impl ContextManager {
             global_config,
             current_profile,
             profile_config,
+            hook_cache: HookCache::new(),
         })
     }
 
@@ -117,6 +170,11 @@ impl ContextManager {
             &mut self.profile_config
         };
 
+        if config.paths.is_none() {
+            config.paths = Some(Vec::new());
+        }
+        let curr_paths = config.paths.as_mut().unwrap();
+
         // Validate paths exist before adding them
         if !force {
             let mut context_files = Vec::new();
@@ -134,10 +192,10 @@ impl ContextManager {
 
         // Add each path, checking for duplicates
         for path in paths {
-            if config.paths.contains(&path) {
+            if curr_paths.contains(&path) {
                 return Err(eyre!("Path '{}' already exists in the context", path));
             }
-            config.paths.push(path);
+            curr_paths.push(path);
         }
 
         // Save the updated configuration
@@ -167,12 +225,14 @@ impl ContextManager {
         let mut removed_any = false;
 
         // Remove each path if it exists
-        for path in paths {
-            let original_len = config.paths.len();
-            config.paths.retain(|p| p != &path);
+        if let Some(curr_paths) = config.paths.as_mut() {
+            for path in paths {
+                let original_len = curr_paths.len();
+                curr_paths.retain(|p| *p != *path);
 
-            if config.paths.len() < original_len {
-                removed_any = true;
+                if curr_paths.len() < original_len {
+                    removed_any = true;
+                }
             }
         }
 
@@ -229,9 +289,9 @@ impl ContextManager {
     pub async fn clear(&mut self, global: bool) -> Result<()> {
         // Clear the appropriate config
         if global {
-            self.global_config.paths.clear();
+            self.global_config.paths.as_mut().map(|p| p.clear());
         } else {
-            self.profile_config.paths.clear();
+            self.profile_config.paths.as_mut().map(|p| p.clear());
         }
 
         // Save the updated configuration
@@ -388,18 +448,93 @@ impl ContextManager {
         let mut context_files = Vec::new();
 
         // Process global paths first
-        for path in &self.global_config.paths {
-            // Use is_validation=false for get_context_files to handle non-matching globs gracefully
-            process_path(&self.ctx, path, &mut context_files, force, false).await?;
+        if let Some(paths) = &self.global_config.paths {
+            for path in paths {
+                // Use is_validation=false for get_context_files to handle non-matching globs gracefully
+                process_path(&self.ctx, path, &mut context_files, force, false).await?;
+            }
         }
 
         // Then process profile-specific paths
-        for path in &self.profile_config.paths {
-            // Use is_validation=false for get_context_files to handle non-matching globs gracefully
-            process_path(&self.ctx, path, &mut context_files, force, false).await?;
+        if let Some(paths) = &self.profile_config.paths {
+                for path in paths {
+                // Use is_validation=false for get_context_files to handle non-matching globs gracefully
+                process_path(&self.ctx, path, &mut context_files, force, false).await?;
+            }
         }
 
         Ok(context_files)
+    }
+
+    pub async fn execute_conversation_start_hooks(&self) -> Vec<(String, (Result<String>, Duration))> {
+        let mut results = Vec::new();
+
+        let global_hooks = if let Some(hooks) = &self.global_config.hooks {
+            hooks.conversation_start.as_ref()
+        } else {
+            None
+        };
+
+        if let Some(global_hooks) = global_hooks {
+            results.extend(execute_hooks(global_hooks).await);
+        }
+
+        let profile_hooks = if let Some(hooks) = &self.profile_config.hooks {
+            hooks.conversation_start.as_ref()
+        } else {
+            None
+        };
+
+        if let Some(profile_hooks) = profile_hooks {
+            results.extend( execute_hooks(profile_hooks).await);
+        }
+        
+        results
+    }
+
+    pub async fn execute_per_prompt_hooks(&self) {
+
+    }
+}
+
+async fn execute_hooks(hooks: &Vec<Hook>) -> Vec<(String, (Result<String>, Duration))> {
+    // Create futures for all hooks to run in parallel
+    let mut futures = Vec::new();
+    for hook in hooks {
+        if !hook.enabled.unwrap_or(true) {
+            continue;
+        }
+
+        futures.push(async {
+            (hook.name.clone(), execute_hook(hook).await)
+        });
+    }
+
+    futures::future::join_all(futures).await
+}
+
+async fn execute_hook(hook: &Hook) -> (Result<String>, Duration) {
+    let start_time = Instant::now();
+    let result = match hook.r#type {
+        HookType::Inline => execute_inline_hook(hook).await,
+    };
+
+    (result, start_time.elapsed())
+}
+
+async fn execute_inline_hook(hook: &Hook) -> Result<String> {
+    let command = hook.command.as_ref().expect("command required for inline hooks");
+
+    let result = run_command(
+        command,
+        hook.max_output_size.unwrap_or(1024*10), 
+        None::<std::io::Stdout>
+    ).await?;
+
+    let exit_code = result.0.unwrap_or_default();
+    match exit_code {
+        0 => Ok(result.1),
+        _ => Err(eyre!("Hook {} failed with exit code {}", hook.name, exit_code)),
     }
 }
 
@@ -427,11 +562,12 @@ async fn load_global_config(ctx: &Context) -> Result<ContextConfig> {
     } else {
         // Return default global configuration with predefined paths
         Ok(ContextConfig {
-            paths: vec![
+            paths: Some(vec![
                 ".amazonq/rules/**/*.md".to_string(),
                 "README.md".to_string(),
                 AMAZONQ_FILENAME.to_string(),
-            ],
+            ]),
+            hooks: None,
         })
     }
 }

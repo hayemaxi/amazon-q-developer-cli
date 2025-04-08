@@ -1,6 +1,7 @@
 mod command;
 mod context;
 mod conversation_state;
+mod hooks;
 mod input_source;
 mod parse;
 mod parser;
@@ -916,7 +917,7 @@ where
                             // Display global context
                             execute!(self.output, style::Print("global:\n"))?;
 
-                            if context_manager.global_config.paths.is_empty() {
+                            if context_manager.global_config.paths.as_ref().is_none_or(|p| p.is_empty()) {
                                 execute!(
                                     self.output,
                                     style::SetForegroundColor(Color::DarkGrey),
@@ -924,7 +925,7 @@ where
                                     style::SetForegroundColor(Color::Reset)
                                 )?;
                             } else {
-                                for path in &context_manager.global_config.paths {
+                                for path in context_manager.global_config.paths.as_ref().unwrap() {
                                     execute!(self.output, style::Print(format!("    {}\n", path)))?;
                                 }
                             }
@@ -932,7 +933,7 @@ where
                             // Display profile context
                             execute!(self.output, style::Print("\nprofile:\n"))?;
 
-                            if context_manager.profile_config.paths.is_empty() {
+                            if context_manager.profile_config.paths.as_ref().is_none_or(|p| p.is_empty()) {
                                 execute!(
                                     self.output,
                                     style::SetForegroundColor(Color::DarkGrey),
@@ -940,7 +941,7 @@ where
                                     style::SetForegroundColor(Color::Reset)
                                 )?;
                             } else {
-                                for path in &context_manager.profile_config.paths {
+                                for path in context_manager.profile_config.paths.as_ref().unwrap() {
                                     execute!(self.output, style::Print(format!("    {}\n", path)))?;
                                 }
                                 execute!(self.output, style::Print("\n"))?;

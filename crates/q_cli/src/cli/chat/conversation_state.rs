@@ -432,38 +432,62 @@ impl ConversationState {
             return None;
         };
 
+        let mut context_content = String::new();
+        
+        // Context from files (and their contents)
         match context_manager.get_context_files(true).await {
             Ok(files) => {
                 if !files.is_empty() {
-                    let mut context_content = String::new();
                     context_content.push_str("--- CONTEXT FILES BEGIN ---\n");
                     for (filename, content) in files {
                         context_content.push_str(&format!("[{}]\n{}\n", filename, content));
                     }
                     context_content.push_str("--- CONTEXT FILES END ---\n\n");
-
-                    let user_msg = UserInputMessage {
-                        content: format!(
-                            "Here is some information from my local q rules files, use these when answering questions:\n\n{}",
-                            context_content
-                        ),
-                        user_input_message_context: None,
-                        user_intent: None,
-                    };
-                    let assistant_msg = AssistantResponseMessage {
-                        message_id: None,
-                        content: "I will use this when generating my response.".into(),
-                        tool_uses: None,
-                    };
-                    Some((user_msg, assistant_msg))
-                } else {
-                    None
                 }
             },
             Err(e) => {
                 warn!("Failed to get context files: {}", e);
-                None
             },
+        };
+
+        // Context from hooks (scripts, commands, tools)
+        let hook_results = context_manager.execute_conversation_start_hooks().await;
+        let mut had_results = false;
+        for (name, (result, duration)) in hook_results {
+            match result {
+                Ok(output) => {
+                    if !had_results {
+                        context_content.push_str("--- PROGRAMMATIC CONTEXT BEGIN ---\n");
+                        had_results = true;
+                    }
+                    context_content.push_str(&format!("{name}: {output}\n"));
+                },
+                Err(e) => {
+                    // do something
+                }
+            }
+        }
+        if had_results {
+            context_content.push_str("--- PROGRAMMATIC CONTEXT END ---\n\n");
+        }
+
+        if !context_content.is_empty() {
+            let user_msg = UserInputMessage {
+                content: format!(
+                    "Here is some information from my local q rules files and/or programmatic calls, use these when answering questions:\n\n{}",
+                    context_content
+                ),
+                user_input_message_context: None,
+                user_intent: None,
+            };
+            let assistant_msg = AssistantResponseMessage {
+                message_id: None,
+                content: "I will use this when generating my response.".into(),
+                tool_uses: None,
+            };
+            Some((user_msg, assistant_msg))
+        } else {
+            None
         }
     }
 
