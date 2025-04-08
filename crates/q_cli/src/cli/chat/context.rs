@@ -1,8 +1,10 @@
+use std::collections::HashMap;
 use std::path::{
     Path,
     PathBuf,
 };
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
 
 use eyre::{
     Result,
@@ -17,13 +19,19 @@ use serde::{
     Serialize,
 };
 
+use crate::cli::chat::hooks::HookConfig;
+
+use super::hooks::{Hook, HookType};
+use super::tools::execute_bash::run_command;
+
 pub const AMAZONQ_FILENAME: &str = "AmazonQ.md";
 
 /// Configuration for context files, containing paths to include in the context.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ContextConfig {
     /// List of file paths or glob patterns to include in the context.
-    pub paths: Vec<String>,
+    pub paths: Option<Vec<String>>,
+    pub hooks: Option<HookConfig>,
 }
 
 #[allow(dead_code)]
@@ -40,6 +48,8 @@ pub struct ContextManager {
 
     /// Context configuration for the current profile.
     pub profile_config: ContextConfig,
+
+    hook_executor: HookExecutor,
 }
 
 #[allow(dead_code)]
@@ -67,6 +77,7 @@ impl ContextManager {
             global_config,
             current_profile,
             profile_config,
+            hook_executor: HookExecutor::new(),
         })
     }
 
@@ -117,6 +128,11 @@ impl ContextManager {
             &mut self.profile_config
         };
 
+        if config.paths.is_none() {
+            config.paths = Some(Vec::new());
+        }
+        let curr_paths = config.paths.as_mut().unwrap();
+
         // Validate paths exist before adding them
         if !force {
             let mut context_files = Vec::new();
@@ -134,10 +150,10 @@ impl ContextManager {
 
         // Add each path, checking for duplicates
         for path in paths {
-            if config.paths.contains(&path) {
+            if curr_paths.contains(&path) {
                 return Err(eyre!("Path '{}' already exists in the context", path));
             }
-            config.paths.push(path);
+            curr_paths.push(path);
         }
 
         // Save the updated configuration
@@ -167,12 +183,14 @@ impl ContextManager {
         let mut removed_any = false;
 
         // Remove each path if it exists
-        for path in paths {
-            let original_len = config.paths.len();
-            config.paths.retain(|p| p != &path);
+        if let Some(curr_paths) = config.paths.as_mut() {
+            for path in paths {
+                let original_len = curr_paths.len();
+                curr_paths.retain(|p| *p != *path);
 
-            if config.paths.len() < original_len {
-                removed_any = true;
+                if curr_paths.len() < original_len {
+                    removed_any = true;
+                }
             }
         }
 
@@ -229,9 +247,9 @@ impl ContextManager {
     pub async fn clear(&mut self, global: bool) -> Result<()> {
         // Clear the appropriate config
         if global {
-            self.global_config.paths.clear();
+            self.global_config.paths.as_mut().map(|p| p.clear());
         } else {
-            self.profile_config.paths.clear();
+            self.profile_config.paths.as_mut().map(|p| p.clear());
         }
 
         // Save the updated configuration
@@ -388,18 +406,308 @@ impl ContextManager {
         let mut context_files = Vec::new();
 
         // Process global paths first
-        for path in &self.global_config.paths {
-            // Use is_validation=false for get_context_files to handle non-matching globs gracefully
-            process_path(&self.ctx, path, &mut context_files, force, false).await?;
+        if let Some(paths) = &self.global_config.paths {
+            for path in paths {
+                // Use is_validation=false for get_context_files to handle non-matching globs gracefully
+                process_path(&self.ctx, path, &mut context_files, force, false).await?;
+            }
         }
 
         // Then process profile-specific paths
-        for path in &self.profile_config.paths {
-            // Use is_validation=false for get_context_files to handle non-matching globs gracefully
-            process_path(&self.ctx, path, &mut context_files, force, false).await?;
+        if let Some(paths) = &self.profile_config.paths {
+                for path in paths {
+                // Use is_validation=false for get_context_files to handle non-matching globs gracefully
+                process_path(&self.ctx, path, &mut context_files, force, false).await?;
+            }
         }
 
         Ok(context_files)
+    }
+
+    pub async fn run_conversation_start_hooks(&self) -> Vec<(String, Result<String>, Duration)> {
+        let mut hooks: Vec<&Hook> = Vec::new();
+
+        self.global_config.hooks.as_ref()
+            .and_then(|hooks| hooks.conversation_start.as_ref())
+            .map(|h| hooks.extend(h));
+    
+
+        self.profile_config.hooks.as_ref()
+            .and_then(|hooks| hooks.conversation_start.as_ref())
+            .map(|h| {
+                hooks.extend(h)
+            });
+
+        self.hook_executor.run_hooks(hooks, true).await
+    }
+
+    pub async fn run_per_prompt_hooks(&self) -> Vec<(String, Result<String>, Duration)> {
+        let mut hooks: Vec<&Hook> = Vec::new();
+
+        self.global_config.hooks.as_ref()
+            .and_then(|hooks| hooks.per_prompt.as_ref())
+            .map(|h| hooks.extend(h));
+    
+
+        self.profile_config.hooks.as_ref()
+            .and_then(|hooks| hooks.per_prompt.as_ref())
+            .map(|h| {
+                hooks.extend(h)
+            });
+
+        self.hook_executor.run_hooks(hooks, false).await
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct HookExecutor {
+    cache_conversation_start: Arc<RwLock<HashMap<String, (String, Instant)>>>,
+    cache_per_prompt: Arc<RwLock<HashMap<String, (String, Instant)>>>,
+    disabled_hooks: HashMap<String, bool>,
+}
+
+impl HookExecutor {
+    pub fn new() -> Self {
+        Self {
+            cache_conversation_start: Arc::new(RwLock::new(HashMap::new())),
+            cache_per_prompt: Arc::new(RwLock::new(HashMap::new())),
+            disabled_hooks: HashMap::new(),
+        }
+    }
+
+    pub async fn run_hooks(&self, hooks: Vec<&Hook>, conversation_start: bool) -> Vec<(String, Result<String>, Duration)> {
+        let mut futures = Vec::new();
+        for hook in hooks {
+            if !hook.enabled.unwrap_or(true) || self.disabled_hooks.get(&hook.name).is_some_and(|b| *b) {
+                continue;
+            }
+            futures.push(self.execute_hook(hook, conversation_start));
+        }
+    
+        futures::future::join_all(futures).await
+    }
+
+    async fn execute_hook(&self, hook: &Hook, conversation_start: bool) -> (String, Result<String>, Duration) {
+        let start_time = Instant::now();
+
+        // Check cache for existing value
+        if let Some(cached_value) = self.get(&hook.name, conversation_start) {
+            return (
+                hook.name.clone(),
+                Ok(cached_value),
+                Duration::from_secs(0),
+            );
+        }
+
+        // Cache miss or expired - execute hook
+        let result = match hook.r#type {
+            HookType::Inline => self.execute_inline_hook(hook).await,
+        };
+
+        // If execution was successful, update cache
+        if let Ok(value) = &result {
+            self.insert(&hook.name, conversation_start, value.clone(), Instant::now() + Duration::from_secs(hook.cache_ttl_seconds.unwrap_or(0)));
+        }
+
+        (hook.name.clone(), result, start_time.elapsed())
+    }
+
+    async fn execute_inline_hook(&self, hook: &Hook) -> Result<String> {
+        let command = hook.command.as_ref().expect("command required for inline hooks");
+    
+        let result = run_command(
+            command,
+            hook.max_output_size.unwrap_or(1024*10), 
+            None::<std::io::Stdout>
+        ).await?;
+    
+        let exit_code = result.0.unwrap_or_default();
+        match exit_code {
+            0 => Ok(result.1),
+            _ => Err(eyre!("Hook {} failed with exit code {}", hook.name, exit_code)),
+        }
+    }
+    
+    // pub async fn execute_conversation_start_hooks(&self) -> Result<Vec<ContextEntry>> {
+    //     // Get enabled conversation start hooks
+    //     let hooks = self.config_manager.get_conversation_start_hooks();
+    //     let mut context_entries = Vec::new();
+        
+    //     // Create futures for all hooks to run in parallel
+    //     let mut futures = Vec::new();
+    //     for hook in hooks {
+    //         if !self.hook_registry.is_hook_enabled(&hook.name) {
+    //             continue;
+    //         }
+            
+    //         let hook_clone = hook.clone();
+    //         let self_clone = self.clone();
+    //         futures.push(async move {
+    //             (hook_clone.name.clone(), self_clone.execute_hook(&hook_clone).await)
+    //         });
+    //     }
+        
+    //     // Wait for all hooks to complete
+    //     let results = futures::future::join_all(futures).await;
+        
+    //     // Process results
+    //     for (name, result) in results {
+    //         match result {
+    //             Ok(output) => {
+    //                 // Format output as context entry
+    //                 let entry = ContextEntry::new(
+    //                     format!("hook:{}", name),
+    //                     output,
+    //                     ContextSource::Hook(name),
+    //                 );
+    //                 context_entries.push(entry);
+    //             }
+    //             Err(e) => {
+    //                 println!("Hook {} failed: {}", name, e);
+    //             }
+    //         }
+    //     }
+        
+    //     Ok(context_entries)
+    // }
+
+    // pub async fn execute_per_prompt_hooks(&self) -> Result<Vec<ContextEntry>> {
+    //     // Similar to execute_conversation_start_hooks but for per-prompt hooks
+    //     // Get enabled per-prompt hooks
+    //     let hooks = self.config_manager.get_per_prompt_hooks();
+    //     let mut context_entries = Vec::new();
+        
+    //     // Create futures for all hooks to run in parallel
+    //     let mut futures = Vec::new();
+    //     for hook in hooks {
+    //         if !self.hook_registry.is_hook_enabled(&hook.name) {
+    //             continue;
+    //         }
+            
+    //         println!("Running hook: {}...", hook.name);
+    //         let start_time = Instant::now();
+            
+    //         match self.execute_hook(hook).await {
+    //             Ok(output) => {
+    //                 let elapsed = start_time.elapsed();
+    //                 println!("Hook {} completed in {:?}", hook.name, elapsed);
+                    
+    //                 // Format output as context entry
+    //                 let entry = ContextEntry::new(
+    //                     format!("hook:{}", hook.name),
+    //                     output,
+    //                     ContextSource::Hook(hook.name.clone()),
+    //                 );
+    //                 context_entries.push(entry);
+    //             }
+    //             Err(e) => {
+    //                 println!("Hook {} failed: {}", hook.name, e);
+    //             }
+    //         }
+    //     }
+        
+    //     Ok(context_entries)
+    // }
+
+    // async fn execute_inline_hook(&self, hook: &HookConfig) -> Result<String> {
+    //     // Check cache first if TTL is set
+    //     if let Some(ttl) = hook.cache_ttl_seconds {
+    //         if let Some(cached_result) = self.cache.get(&hook.name) {
+    //             if cached_result.timestamp.elapsed().as_secs() < ttl {
+    //                 return Ok(cached_result.output.clone());
+    //             }
+    //         }
+    //     }
+        
+    //     // Execute hook.command in shell using tokio::process::Command
+    //     let start = Instant::now();
+        
+    //     // Create a future with timeout
+    //     let timeout_duration = Duration::from_millis(hook.timeout_ms.unwrap_or(5000));
+    //     let command_future = async {
+    //         Command::new("sh")
+    //             .arg("-c")
+    //             .arg(&hook.command.as_ref().unwrap())
+    //             .output()
+    //             .await
+    //     };
+        
+    //     // Run with timeout
+    //     let output = match tokio::time::timeout(timeout_duration, command_future).await {
+    //         Ok(result) => result?,
+    //         Err(_) => {
+    //             // Handle timeout based on criticality
+    //             match hook.criticality {
+    //                 Criticality::Fail => {
+    //                     return Err(anyhow!("Hook timed out after {:?}", timeout_duration));
+    //                 },
+    //                 Criticality::Warn => {
+    //                     println!("Warning: Hook '{}' timed out after {:?}", hook.name, timeout_duration);
+    //                     return Ok(format!("# Warning: Hook '{}' timed out", hook.name));
+    //                 },
+    //                 Criticality::Ignore => {
+    //                     return Ok(String::new());
+    //                 }
+    //             }
+    //         }
+    //     };
+            
+    //     if !output.status.success() {
+    //         // Handle command failure based on criticality
+    //         match hook.criticality {
+    //             Criticality::Fail => {
+    //                 return Err(anyhow!("Command failed with status: {}", output.status));
+    //             },
+    //             Criticality::Warn => {
+    //                 println!("Warning: Hook '{}' failed with status: {}", hook.name, output.status);
+    //                 return Ok(format!("# Warning: Hook '{}' failed with status: {}", 
+    //                     hook.name, output.status));
+    //             },
+    //             Criticality::Ignore => {
+    //                 return Ok(String::new());
+    //             }
+    //         }
+    //     }
+        
+    //     // Capture stdout and handle errors
+    //     let stdout = String::from_utf8(output.stdout)?;
+        
+    //     // Apply size limits if configured
+    //     if let Some(max_size) = hook.max_output_size {
+    //         if stdout.len() > max_size {
+    //             return Ok(format!("{}\n... (output truncated, exceeded {} bytes)", 
+    //                 &stdout[..max_size], max_size));
+    //         }
+    //     }
+        
+    //     Ok(stdout)
+    //     // Handle errors and timeouts
+    // }
+
+    fn get(&self, name: &str, conversation_start: bool) -> Option<String> {
+        let cache = if conversation_start {
+            &self.cache_conversation_start
+        } else {
+            &self.cache_per_prompt
+        };
+
+        cache.read().unwrap().get(name).and_then(|(value, expiry)| {
+            if Instant::now() < *expiry {
+                Some(value.clone())
+            } else {
+                None
+            }
+        })
+    }
+
+    fn insert(&self, name: &str, conversation_start: bool, output: String, expiry: Instant) {
+        let cache = if conversation_start {
+            &self.cache_conversation_start
+        } else {
+            &self.cache_per_prompt
+        };
+
+        cache.write().unwrap().insert(name.to_string(), (output, expiry));
     }
 }
 
@@ -427,11 +735,12 @@ async fn load_global_config(ctx: &Context) -> Result<ContextConfig> {
     } else {
         // Return default global configuration with predefined paths
         Ok(ContextConfig {
-            paths: vec![
+            paths: Some(vec![
                 ".amazonq/rules/**/*.md".to_string(),
                 "README.md".to_string(),
                 AMAZONQ_FILENAME.to_string(),
-            ],
+            ]),
+            hooks: None,
         })
     }
 }

@@ -7,6 +7,8 @@ use crossterm::{
 };
 use eyre::Result;
 
+use super::hooks::Criticality;
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
     Ask { prompt: String },
@@ -68,6 +70,17 @@ Profiles allow you to organize and manage different sets of context files for di
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HooksSubCommand {
+    Add { name: String, r#type: String, command: String, cache_ttl_seconds: u64, timeout_ms: u64, criticality: Criticality },
+    Remove { name: String },
+    Enable { name: String },
+    Disable { name: String },
+    EnableAll,
+    DisableAll,
+    Help,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ContextSubcommand {
     Show {
         expand: bool,
@@ -83,6 +96,9 @@ pub enum ContextSubcommand {
     },
     Clear {
         global: bool,
+    },
+    Hooks {
+        subcommand: HooksSubCommand,
     },
     Help,
 }
@@ -409,6 +425,24 @@ impl Command {
                         "help" => Self::Context {
                             subcommand: ContextSubcommand::Help,
                         },
+                        "hooks" => {
+                            // now start handling subcommands manually wih strings
+                            for part in &parts[2..] {
+                                if *part == "--global" {
+                                    global = true;
+                                } else {
+                                    paths.push((*part).to_string());
+                                }
+                            }
+
+                            if paths.is_empty() {
+                                usage_err!(ContextSubcommand::REMOVE_USAGE);
+                            }
+
+                            Self::Context {
+                                subcommand: ContextSubcommand::Remove { global, paths },
+                            },
+                        }
                         other => {
                             return Err(ContextSubcommand::usage_msg(format!("Unknown subcommand '{}'.", other)));
                         },

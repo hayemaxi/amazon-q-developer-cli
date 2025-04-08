@@ -135,34 +135,31 @@ impl ConversationState {
             input
         };
 
-        // Get context files if available
-        let context_files = if let Some(context_manager) = &self.context_manager {
+        // Get context if available
+        let mut context_content = String::new();
+        if let Some(context_manager) = &self.context_manager {
             match context_manager.get_context_files(true).await {
                 Ok(files) => {
                     if !files.is_empty() {
-                        let mut context_content = String::new();
                         context_content.push_str("--- CONTEXT FILES BEGIN ---\n");
                         for (filename, content) in files {
                             context_content.push_str(&format!("[{}]\n{}\n", filename, content));
                         }
                         context_content.push_str("--- CONTEXT FILES END ---\n\n");
-                        Some(context_content)
-                    } else {
-                        None
                     }
                 },
-                Err(e) => {
-                    warn!("Failed to get context files: {}", e);
-                    None
-                },
+                Err(e) => warn!("Failed to get context files: {}", e),
             }
-        } else {
-            None
-        };
+        }
+
+        // Context from hooks (scripts, commands, tools)
+        if let Some(hook_context) = self.get_hook_context(false).await {
+            context_content.push_str(&hook_context);
+        }
 
         // Combine context files with user input if available
-        let content = if let Some(context) = context_files {
-            format!("{}\n{}", context, input)
+        let content = if !context_content.is_empty() {
+            format!("{}\n{}", context_content, input)
         } else {
             input
         };
@@ -432,39 +429,81 @@ impl ConversationState {
             return None;
         };
 
+        let mut context_content = String::new();
+        
+        // Context from files (and their contents)
         match context_manager.get_context_files(true).await {
             Ok(files) => {
                 if !files.is_empty() {
-                    let mut context_content = String::new();
                     context_content.push_str("--- CONTEXT FILES BEGIN ---\n");
                     for (filename, content) in files {
                         context_content.push_str(&format!("[{}]\n{}\n", filename, content));
                     }
                     context_content.push_str("--- CONTEXT FILES END ---\n\n");
-
-                    let user_msg = UserInputMessage {
-                        content: format!(
-                            "Here is some information from my local q rules files, use these when answering questions:\n\n{}",
-                            context_content
-                        ),
-                        user_input_message_context: None,
-                        user_intent: None,
-                    };
-                    let assistant_msg = AssistantResponseMessage {
-                        message_id: None,
-                        content: "I will use this when generating my response.".into(),
-                        tool_uses: None,
-                    };
-                    Some((user_msg, assistant_msg))
-                } else {
-                    None
                 }
             },
-            Err(e) => {
-                warn!("Failed to get context files: {}", e);
-                None
-            },
+            Err(e) => warn!("Failed to get context files: {}", e),
+        };
+
+        // Context from hooks (scripts, commands, tools)
+        if let Some(hook_context) = self.get_hook_context(true).await {
+            context_content.push_str(&hook_context);
         }
+
+        if !context_content.is_empty() {
+            let user_msg = UserInputMessage {
+                content: format!(
+                    "Here is some information from my local q rules files and/or programmatic calls, use these when answering all questions. \
+                    It should be used in conjunction with whatever newer context is available:\n\n{}",
+                    context_content
+                ),
+                user_input_message_context: None,
+                user_intent: None,
+            };
+            let assistant_msg = AssistantResponseMessage {
+                message_id: None,
+                content: "I will use this when generating my responses.".into(),
+                tool_uses: None,
+            };
+            Some((user_msg, assistant_msg))
+        } else {
+            None
+        }
+    }
+
+    pub async fn get_hook_context(&self, conversation_start: bool) -> Option<String> {
+        let Some(context_manager) = &self.context_manager else {
+            return None;
+        };
+
+        let mut context_content = String::new();
+
+        let hook_results = if conversation_start {
+            context_manager.run_conversation_start_hooks().await
+        } else {
+            context_manager.run_per_prompt_hooks().await
+        };
+        let mut had_results = false;
+        for (name, result, duration) in hook_results {
+            match result {
+                Ok(output) => {
+                    if !had_results {
+                        context_content.push_str("--- PROGRAMMATIC CONTEXT BEGIN ---\n");
+                        had_results = true;
+                    }
+                    context_content.push_str(&format!("{name}: {output}\n"));
+                },
+                Err(e) => {
+                    // do something
+                }
+            }
+        }
+        if !had_results {
+            return None
+        }
+
+        context_content.push_str("--- PROGRAMMATIC CONTEXT END ---\n\n");
+        Some(context_content)
     }
 
     /// The length of the user message used as context, if any.

@@ -146,21 +146,21 @@ impl GhIssue {
         }
 
         // Context file categories
-        if ctx_manager.global_config.paths.is_empty() {
+        if ctx_manager.global_config.paths.as_ref().is_none_or(|p| p.is_empty()) {
             ctx_str.push_str("global_context=none\n\n");
         } else {
             ctx_str.push_str(&format!(
                 "global_context=\n{}\n\n",
-                &ctx_manager.global_config.paths.join("\n")
+                ctx_manager.global_config.paths.as_ref().unwrap().join("\n")
             ));
         }
 
-        if ctx_manager.profile_config.paths.is_empty() {
+        if ctx_manager.profile_config.paths.as_ref().is_none_or(|p| p.is_empty()) {
             ctx_str.push_str("profile_context=none\n\n");
         } else {
             ctx_str.push_str(&format!(
                 "profile_context=\n{}\n\n",
-                &ctx_manager.profile_config.paths.join("\n")
+                ctx_manager.profile_config.paths.as_ref().unwrap().join("\n")
             ));
         }
 
