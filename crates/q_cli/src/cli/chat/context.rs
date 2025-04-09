@@ -4,7 +4,6 @@ use std::path::{
     PathBuf,
 };
 use std::sync::Arc;
-use std::time::Duration;
 
 use eyre::{
     Result,
@@ -421,7 +420,7 @@ impl ContextManager {
         Ok(context_files)
     }
 
-    pub fn add_hook(&mut self, hook: Hook, global: bool, conversation_start: bool) {
+    pub async fn add_hook(&mut self, hook: Hook, global: bool, conversation_start: bool) -> Result<()> {
         let config = if global {
             &mut self.global_config
         } else {
@@ -435,54 +434,72 @@ impl ContextManager {
         };
 
         hook_vec.push(hook);
-        self.save_config(global);
+        self.save_config(global).await
     }
 
-    pub fn remove_hook(&mut self, name: &str, global: bool, conversation_start: bool) {
+    pub async fn remove_hook(&mut self, name: &str, global: bool) -> Result<()> {
         let config = if global {
             &mut self.global_config
         } else {
             &mut self.profile_config
         };
 
-        let current_hooks = if conversation_start {
-            &mut config.hooks.conversation_start
-        } else {
-            &mut config.hooks.per_prompt
-        };
-
-        current_hooks.retain(|h| h.name != name);
-        self.save_config(global);
+        config.hooks.conversation_start.retain(|h| h.name != name);
+        config.hooks.per_prompt.retain(|h| h.name != name);
+        self.save_config(global).await
     }
 
-    pub fn enable_hook(&mut self, name: &str, global: bool) {
+    pub async fn enable_hook(&mut self, name: &str, global: bool) -> Result<()> {
+        let config = if global {
+            &mut self.global_config
+        } else {
+            &mut self.profile_config
+        };
+        
+        config.hooks.conversation_start.iter_mut().for_each(|h| if h.name == name { h.enabled = true });
+        config.hooks.per_prompt.iter_mut().for_each(|h| if h.name == name { h.enabled = true });
+        self.save_config(global).await
+    }
+
+    pub async fn disable_hook(&mut self, name: &str, global: bool)  -> Result<()> {
+        let config = if global {
+            &mut self.global_config
+        } else {
+            &mut self.profile_config
+        };
+        
+        config.hooks.conversation_start.iter_mut().for_each(|h| if h.name == name { h.enabled = false });
+        config.hooks.per_prompt.iter_mut().for_each(|h| if h.name == name { h.enabled = false });
+        self.save_config(global).await
+    }
+
+    pub async fn enable_all_hooks(&mut self, global: bool) -> Result<()> {
         // how to account for per-prompt vs conversation start?
         let config = if global {
             &mut self.global_config
         } else {
             &mut self.profile_config
         };
-        config.hooks.conversation_start.iter_mut().for
+
+        config.hooks.conversation_start.iter_mut().for_each(|h| h.enabled = true );
+        config.hooks.per_prompt.iter_mut().for_each(|h| h.enabled = true );
+        self.save_config(global).await
     }
 
-    pub fn disable_hook(&mut self, name: &str) {
-        self.hook_executor.disabled_hooks.insert(name.to_string());
-    }
-
-    pub fn enable_all_hooks(&mut self, name: &str, global: bool) {
+    pub async fn disable_all_hooks(&mut self, global: bool) -> Result<()> {
         // how to account for per-prompt vs conversation start?
         let config = if global {
             &mut self.global_config
         } else {
             &mut self.profile_config
         };
+
+        config.hooks.conversation_start.iter_mut().for_each(|h| h.enabled = false );
+        config.hooks.per_prompt.iter_mut().for_each(|h| h.enabled = false );
+        self.save_config(global).await
     }
 
-    pub fn disable_all_hooks(&mut self, name: &str) {
-        self.hook_executor.disabled_hooks.insert(name.to_string());
-    }
-
-    pub async fn run_conversation_start_hooks(&self, updates: &mut impl Write) -> Vec<(String, Result<String>, Duration)> {
+    pub async fn run_conversation_start_hooks(&self, updates: &mut impl Write) -> Vec<(String, Result<String>)> {
         let mut hooks: Vec<&Hook> = Vec::new();
 
         hooks.extend(self.global_config.hooks.conversation_start.iter());
@@ -491,7 +508,7 @@ impl ContextManager {
         self.hook_executor.run_hooks(hooks, true, updates).await
     }
 
-    pub async fn run_per_prompt_hooks(&self, updates: &mut impl Write) -> Vec<(String, Result<String>, Duration)> {
+    pub async fn run_per_prompt_hooks(&self, updates: &mut impl Write) -> Vec<(String, Result<String>)> {
         let mut hooks: Vec<&Hook> = Vec::new();
 
         hooks.extend(self.global_config.hooks.per_prompt.iter());

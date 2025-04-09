@@ -1,27 +1,20 @@
-use std::{collections::{HashMap, HashSet}, io::Write, sync::Arc, time::{Duration, Instant}};
+use std::{collections::HashMap, io::Write, sync::Arc, time::{Duration, Instant}};
 
 use serde::{
     Deserialize,
     Serialize,
 };
-use clap::ValueEnum;
 use tokio::sync::RwLock;
 use eyre::{
     Result,
     eyre,
 };
 
-use crossterm::style::{
-    Attribute,
-    Color,
-    Stylize,
-};
+use crossterm::style::Color;
 use crossterm::{
-    cursor,
     execute,
     queue,
     style,
-    terminal,
 };
 
 use super::tools::execute_bash::run_command;
@@ -33,25 +26,21 @@ pub enum HookType {
     // Addtional hooks as necessary
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ValueEnum)]
-#[serde(rename_all = "lowercase")]
-pub enum Criticality {
-    Fail,    // Hook failure will prevent prompt from being sent
-    Warn,    // Hook failure will log a warning but allow prompt to be sent
-    Ignore,  // Hook failure will be silently ignored
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Hook {
     pub name: String,
     pub r#type: HookType,
-    pub enabled: Option<bool>,
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
     pub timeout_ms: Option<u64>,
     pub max_output_size: Option<usize>,
-    pub criticality: Option<Criticality>,
     pub cache_ttl_seconds: Option<u64>,
     // Type-specific fields
     pub command: Option<String>,     // For inline hooks
+}
+
+fn default_enabled() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -73,7 +62,6 @@ impl Default for HookConfig {
 pub struct HookExecutor {
     cache_conversation_start: Arc<RwLock<HashMap<String, (String, Instant)>>>,
     cache_per_prompt: Arc<RwLock<HashMap<String, (String, Instant)>>>,
-    pub disabled_hooks: HashSet<String>,
 }
 
 impl HookExecutor {
@@ -81,7 +69,6 @@ impl HookExecutor {
         Self {
             cache_conversation_start: Arc::new(RwLock::new(HashMap::new())),
             cache_per_prompt: Arc::new(RwLock::new(HashMap::new())),
-            disabled_hooks: HashSet::new(),
         }
     }
 
@@ -89,6 +76,9 @@ impl HookExecutor {
         let mut futures = Vec::new();
         // Start hooks
         for hook in hooks {
+            if !hook.enabled {
+                continue;
+            }
             futures.push(self.execute_hook(hook, conversation_start));
         }
 
@@ -110,36 +100,28 @@ impl HookExecutor {
         queue!(
             updates,
             style::SetForegroundColor(Color::Green),
-            style::Print(format!("completed in {} ms\n\n", total_duration)),
+            style::Print(format!("completed in {} ms\n", total_duration)),
             style::SetForegroundColor(Color::Reset),
         );
 
         for r in &results {
-            match r.1 {
-                Ok(result) => {
-                    if !result.is_empty() {
-                        queue!(
-                            updates,
-                            style::Print(format!("{}: ", r.0)),
-                            style::Print(result),
-                            style::Print("\n"),
-                        );
-                    }
-                },
+            match &r.1 {
                 Err(e) => {
                     queue!(
                         updates,
                         style::SetForegroundColor(Color::Red),
-                        style::Print(format!("{}: ", r.0)),
-                        style::Print(format!("Error: {}", e)),
-                        style::Print("\n"),
+                        style::Print(format!("Hook `{}` failed: \n{}\n", r.0, e)),
+                        style::SetForegroundColor(Color::Reset),
                     );
-                }
+                },
+                _ => ()
             }
         }
+        execute!(updates, style::Print("\n"));
 
         results.into_iter().map(|r| (r.0, r.1)).collect()
     }
+
     async fn execute_hook(&self, hook: &Hook, conversation_start: bool) -> (String, Result<String>, Duration) {
         let start_time = Instant::now();
 
@@ -169,56 +151,23 @@ impl HookExecutor {
         let command = hook.command.as_ref().expect("command required for inline hooks");
         let command_future = run_command(
             command,
-            hook.max_output_size.unwrap_or(1024*10), 
+            hook.max_output_size.unwrap_or(1024 * 10), 
             None::<std::io::Stdout>
         );
         let timeout = Duration::from_millis(hook.timeout_ms.unwrap_or(10000));
 
         // Run with timeout
-        match tokio::time::timeout(timeout, command_future).await {
+        match tokio::time::timeout(timeout, command_future).await? {
             Ok(result) => {
-                match result {
-                    Ok(result) => {
-                        let exit_status = result.exit_status.unwrap_or(0);
-                        if exit_status != 0 {
-                            // Handle command failure based on criticality
-                            match hook.criticality.clone().unwrap_or(Criticality::Warn) {
-                                Criticality::Fail => {
-                                    return Err(eyre!("Command failed with status: {}", exit_status));
-                                },
-                                Criticality::Warn => {
-                                    println!("Warning: Hook '{}' failed with status: {}", hook.name, exit_status);
-                                    return Ok(format!("# Warning: Hook '{}' failed with status: {}", 
-                                        hook.name, exit_status));
-                                },
-                                Criticality::Ignore => {
-                                    return Ok(String::new());
-                                }
-                            }
-                        } else{
-                            Ok(result.stdout)
-                        }
-                    },
-                    Err(_) => {
-                        return Err(eyre!("Hook timed out after {:?}", timeout));
-                    },
-                
+                let exit_status = result.exit_status.unwrap_or(0);
+                if exit_status != 0 {
+                    Err(eyre!("command returned non-zero exit code {}, stderr: {}", exit_status, result.stderr))
+                } else{
+                    Ok(result.stdout)
                 }
             },
             Err(_) => {
-                // Handle timeout based on criticality
-                match hook.criticality.clone().unwrap_or(Criticality::Warn) {
-                    Criticality::Fail => {
-                        return Err(eyre!("Hook timed out after {:?}", timeout));
-                    },
-                    Criticality::Warn => {
-                        println!("Warning: Hook '{}' timed out after {:?}", hook.name, timeout);
-                        return Ok(format!("# Warning: Hook '{}' timed out", hook.name));
-                    },
-                    Criticality::Ignore => {
-                        return Ok(String::new());
-                    }
-                }
+                Err(eyre!("command timed out after {} ms.", timeout.as_millis()))
             }
         }
     }

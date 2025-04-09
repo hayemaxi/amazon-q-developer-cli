@@ -8,8 +8,6 @@ use crossterm::{
 };
 use eyre::Result;
 
-use super::hooks::Criticality;
-
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
     Ask { prompt: String },
@@ -71,7 +69,7 @@ Profiles allow you to organize and manage different sets of context files for di
 }
 
 #[derive(Parser, Debug, Clone)]
-#[command(name = "hooks", disable_help_subcommand = true)]
+#[command(name = "hooks", disable_help_flag = true, disable_help_subcommand = true)]
 struct HooksCommand {
     #[command(subcommand)]
     command: HooksSubcommand,
@@ -85,48 +83,52 @@ pub enum HooksSubcommand {
         #[arg(long)]
         name: String,
         
-        /// Type of the hook
-        #[arg(long)]
-        r#type: String,
+        /// When to run the hook
+        #[arg(long, value_parser = ["per_prompt", "conversation_start"])]
+        when: String,
         
         /// Command to execute
+        #[arg(long, value_parser = clap::value_parser!(String))]
+        command: String,
+
         #[arg(long)]
-        command: Option<String>,
-        
-        /// Cache TTL in seconds
-        #[arg(long, default_value = "0")]
-        cache_ttl_seconds:  Option<u64>,
-        
-        /// Timeout in milliseconds
-        #[arg(long, default_value = "0")]
-        timeout_ms:  Option<u64>,
-        
-        /// Criticality level (fail, warn, ignore)
-        #[arg(long, default_value = "ignore")]
-        criticality:  Option<Criticality>,
+        global: bool
     },
     /// Remove a hook
+    #[command(name = "rm")]
     Remove {
         /// Name of the hook to remove
-        #[arg(long)]
         name: String,
+        
+        #[arg(long)]
+        global: bool
     },
     /// Enable a specific hook
     Enable {
         /// Name of the hook to enable
-        #[arg(long)]
         name: String,
+
+        #[arg(long)]
+        global: bool
     },
     /// Disable a specific hook
     Disable {
         /// Name of the hook to disable
-        #[arg(long)]
         name: String,
+
+        #[arg(long)]
+        global: bool
     },
     /// Enable all hooks
-    EnableAll,
+    EnableAll {
+        #[arg(long)]
+        global: bool
+    },
     /// Disable all hooks
-    DisableAll,
+    DisableAll {
+        #[arg(long)]
+        global: bool
+    },
     /// Display help information
     Help,
 }
@@ -181,13 +183,44 @@ impl ContextSubcommand {
                                  <black!>--global: Remove from global context</black!>
 
   <em>clear [--global]</em>               <black!>Clear all files from current context</black!>
-                                 <black!>--global: Clear global context</black!>"};
+                                 <black!>--global: Clear global context</black!>
+
+  <em>hooks</em>                          <black!>Display and manage context hooks</black!>"};
+
+    const HOOKS_AVAILABLE_COMMANDS: &str = color_print::cstr! {"<cyan!>Available hooks subcommands</cyan!>
+  <em>hooks help</em>                         <black!>Show an explanation for the contexthooks commands</black!>
+
+  <em>hooks add [--global]</em>               <black!>Add a new command context hook</black!>
+                                         <black!>--global: Add to global context</black!>
+         <em>--name <<name>></em>                   <black!>Unique name of the hook</black!>
+         <em>--when <<trigger>></em>                <black!>When to trigger the hook. Valid options: `per_prompt` or `conversation_start`</black!>
+         <em>--command <<command>></em>             <black!>Shell command to execute</black!>
+
+  <em>hooks rm [--global] <<name>></em>         <black!>Remove an existing context hook</black!>
+                                         <black!>--global: Remove from global context</black!>
+
+  <em>hooks enable [--global] <<name>></em>     <black!>Enable an existing context hook</black!>
+                                         <black!>--global: Enable in global context</black!>
+
+  <em>hooks disable [--global] <<name>></em>    <black!>Disable an existing context hook</black!>
+                                         <black!>--global: Disable in global context</black!>
+
+  <em>hooks enable-all [--global]</em>        <black!>Enable all registered context hooks</black!>
+                                         <black!>--global: Enable all in global context</black!>
+
+  <em>hooks disable-all [--global]</em>       <black!>Disable all registered context hooks</black!>
+                                         <black!>--global: Disable all in global context</black!>"};
+
     const CLEAR_USAGE: &str = "/context clear [--global]";
     const REMOVE_USAGE: &str = "/context rm [--global] <path1> [path2...]";
     const SHOW_USAGE: &str = "/context show [--expand]";
 
     fn usage_msg(header: impl AsRef<str>) -> String {
         format!("{}\n\n{}", header.as_ref(), Self::AVAILABLE_COMMANDS)
+    }
+
+    fn hooks_usage_msg(header: impl AsRef<str>) -> String {
+        format!("{}\n\n{}", header.as_ref(), Self::HOOKS_AVAILABLE_COMMANDS)
     }
 
     pub fn help_text() -> String {
@@ -198,15 +231,39 @@ impl ContextSubcommand {
 Context files provide Amazon Q with additional information about your project or environment.
 Adding relevant files to your context helps Amazon Q provide more accurate and helpful responses.
 
+In addition to files, you can specify hooks that will run commands and return the output as context
+to Amazon Q.
+
 {}
 
 <cyan!>Notes</cyan!>
 • You can add specific files or use glob patterns (e.g., "*.py", "src/**/*.js")
-• Context files are associated with the current profile
-• Global context files are available across all profiles
+• Context files and hooks are associated with the current profile
+• Global context files and hooks are available across all profiles
 • Context is preserved between chat sessions
 "#,
             Self::AVAILABLE_COMMANDS
+        )
+    }
+
+    pub fn hooks_help_text() -> String {
+        color_print::cformat!(
+            r#"
+<magenta,em>(Beta) Hook Context</magenta,em>
+
+Specify context hooks for Amazon Q to execute. The outputs will be appended
+to the prompt to Amazon Q. Hooks can be attached to global or local profiles.
+
+Types of Hooks:
+• `conversation_start`: Run the once hook when the conversation starts
+• `per-prompt`: Run the hook before each prompt is sent to Amazon Q
+
+{}
+
+<cyan!>Notes</cyan!>
+• ...
+"#,
+            Self::HOOKS_AVAILABLE_COMMANDS
         )
     }
 }
@@ -498,8 +555,7 @@ impl Command {
 
                             match Self::parse_hooks(&parts) {
                                 Ok(command) => command,
-                                Err(err) => return Err(ContextSubcommand::usage_msg(format!("Unknown subcommand '{}'.", err))),
-                            
+                                Err(err) => return Err(ContextSubcommand::hooks_usage_msg(err)),
                             }
                         },
                         other => {
@@ -579,34 +635,35 @@ impl Command {
 
     fn parse_hooks(parts: &Vec<&str>) -> Result<Self, String> {
         // Skip the first two parts ("/context" and "hooks")
-        let args = parts[1..].join(" ");
-        
+        let args = match shlex::split(&parts[1..].join(" ")) {
+            Some(args) => args,
+            None => return Err("Failed to parse quoted arguments".to_string()),
+        };
+                
         // Parse with Clap
-        match HooksCommand::try_parse_from(args.split_whitespace()) {
+        match HooksCommand::try_parse_from(args) {
             Ok(hooks_command) => {
                 // Convert Clap command to your internal Command enum
                 let subcommand = match hooks_command.command {
-                    HooksSubcommand::Add { name, r#type, command, cache_ttl_seconds, timeout_ms, criticality } => {
+                    HooksSubcommand::Add { name, when, command, global } => {
                         Some(HooksSubcommand::Add {
                             name,
-                            r#type,
+                            when,
                             command,
-                            cache_ttl_seconds,
-                            timeout_ms,
-                            criticality,
+                            global,
                         })
                     },
-                    HooksSubcommand::Remove { name } => {
-                        Some(HooksSubcommand::Remove { name })
+                    HooksSubcommand::Remove { name, global } => {
+                        Some(HooksSubcommand::Remove { name, global })
                     },
-                    HooksSubcommand::Enable { name } => {
-                        Some(HooksSubcommand::Enable { name })
+                    HooksSubcommand::Enable { name, global } => {
+                        Some(HooksSubcommand::Enable { name, global })
                     },
-                    HooksSubcommand::Disable { name } => {
-                        Some(HooksSubcommand::Disable { name })
+                    HooksSubcommand::Disable { name , global } => {
+                        Some(HooksSubcommand::Disable { name, global })
                     },
-                    HooksSubcommand::EnableAll => Some(HooksSubcommand::EnableAll),
-                    HooksSubcommand::DisableAll => Some(HooksSubcommand::DisableAll),
+                    HooksSubcommand::EnableAll {global} => Some(HooksSubcommand::EnableAll { global }),
+                    HooksSubcommand::DisableAll {global}=> Some(HooksSubcommand::DisableAll { global }),
                     HooksSubcommand::Help => Some(HooksSubcommand::Help),
                 };
                 
@@ -625,9 +682,6 @@ impl Command {
     //             let mut name = String::new();
     //             let mut r#type = String::new();
     //             let mut command = String::new();
-    //             let mut cache_ttl_seconds = 0;
-    //             let mut timeout_ms = 0;
-    //             let mut criticality = Criticality::Ignore;
 
     //             let mut i = 3;
     //             while i < parts.len() {
@@ -649,34 +703,7 @@ impl Command {
     //                             command = val.to_string();
     //                             i += 2;
     //                         }
-    //                     }
-    //                     "--cache-ttl" => {
-    //                         if let Some(val) = parts.get(i + 1) {
-    //                             if let Ok(ttl) = val.parse() {
-    //                                 cache_ttl_seconds = ttl;
-    //                                 i += 2;
-    //                             }
-    //                         }
-    //                     }
-    //                     "--timeout" => {
-    //                         if let Some(val) = parts.get(i + 1) {
-    //                             if let Ok(timeout) = val.parse() {
-    //                                 timeout_ms = timeout;
-    //                                 i += 2;
-    //                             }
-    //                         }
-    //                     }
-    //                     "--criticality" => {
-    //                         if let Some(val) = parts.get(i + 1) {
-    //                             criticality = match val.to_lowercase().as_str() {
-    //                                 "fail" => Criticality::Fail,
-    //                                 "warn" => Criticality::Warn,
-    //                                 "ignore" => Criticality::Ignore,
-    //                                 _ => (),
-    //                             };
-    //                             i += 2;
-    //                         }
-    //                     }
+    //                     },
     //                     _ => i += 1
     //                 }
     //             }
@@ -687,9 +714,6 @@ impl Command {
     //                         name,
     //                         r#type,
     //                         command,
-    //                         cache_ttl_seconds,
-    //                         timeout_ms,
-    //                         criticality
     //                     })
     //                 }
     //             }

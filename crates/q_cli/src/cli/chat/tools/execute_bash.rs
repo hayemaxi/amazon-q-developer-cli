@@ -117,13 +117,13 @@ impl ExecuteBash {
 }
 
 // Tuple where 0: exit code, 1: stdout, 2: stderr
-struct RunResult {
+pub struct CommandResult {
     pub exit_status: Option<i32>,
     pub stdout: String,
     pub stderr: String,
 }
 
-pub async fn run_command<W: Write>(command: &str, max_result_size: usize, mut updates: Option<W>) -> Result<RunResult> {
+pub async fn run_command<W: Write>(command: &str, max_result_size: usize, mut updates: Option<W>) -> Result<CommandResult> {
     // We need to maintain a handle on stderr and stdout, but pipe it to the terminal as well
     let mut child = tokio::process::Command::new("bash")
         .arg("-c")
@@ -191,7 +191,7 @@ pub async fn run_command<W: Write>(command: &str, max_result_size: usize, mut up
     let stdout = stdout_buf.into_iter().collect::<Vec<_>>().join("\n");
     let stderr = stderr_buf.into_iter().collect::<Vec<_>>().join("\n");
 
-    Ok(RunResult { exit_status: exit_status.code(), stdout: format!(
+    Ok(CommandResult { exit_status: exit_status.code(), stdout: format!(
             "{}{}",
             truncate_safe(&stdout, max_result_size),
             if stdout.len() > max_result_size {

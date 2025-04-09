@@ -56,6 +56,7 @@ use fig_api_client::model::{
 use fig_os_shim::Context;
 use fig_settings::Settings;
 use fig_util::CLI_BINARY_NAME;
+use hooks::{Hook, HookType};
 use input_source::InputSource;
 use parser::{
     RecvErrorKind,
@@ -1076,17 +1077,25 @@ where
                         command::ContextSubcommand::Hooks { subcommand } => {
                             if let Some(subcommand) = subcommand {
                                 match subcommand {
-                                    command::HooksSubcommand::Add {  } => {
-                                        context_manager.add_hook();
+                                    command::HooksSubcommand::Add { name, when, command, global } => {
+                                        context_manager.add_hook(Hook {
+                                            name: name.clone(),
+                                            r#type: HookType::Inline,
+                                            command: Some(command.clone()),
+                                            enabled: true,
+                                            timeout_ms: None,
+                                            max_output_size: None,
+                                            cache_ttl_seconds: None,
+                                        }, global, when.eq("conversation_start")).await;
                                         execute!(
                                             self.output,
                                             style::SetForegroundColor(Color::Green),
-                                            style::Print(format!("\nAdded hook '{hook_name}' with command '{command}'\n\n")),
+                                            style::Print(format!("\nAdded hook '{name}'\n\n")),
                                             style::SetForegroundColor(Color::Reset)
                                         )?;
                                     },
-                                    command::HooksSubcommand::Remove { name } => {
-                                        context_manager.remove_hook(name);
+                                    command::HooksSubcommand::Remove { name, global } => {
+                                        context_manager.remove_hook(&name, global).await;
                                         execute!(
                                             self.output,
                                             style::SetForegroundColor(Color::Green),
@@ -1095,20 +1104,48 @@ where
                                         )?;
                                     },
                                     command::HooksSubcommand::Enable { name, global } => {
-                                        context_manager.enable_hook(name, global);
+                                        context_manager.enable_hook(&name, global).await;
                                         execute!(
                                             self.output,
                                             style::SetForegroundColor(Color::Green),
-                                            style::Print(format!("\nRemoved hook '{name}'\n\n")),
+                                            style::Print(format!("\nEnabled hook '{name}'\n\n")),
                                             style::SetForegroundColor(Color::Reset)
                                         )?;
                                     },
                                     command::HooksSubcommand::Disable { name, global } => {
-                                        context_manager.disable_hook(name, global);
+                                        context_manager.disable_hook(&name, global).await;
                                         execute!(
                                             self.output,
                                             style::SetForegroundColor(Color::Green),
-                                            style::Print(format!("\nRemoved hook '{name}'\n\n")),
+                                            style::Print(format!("\nDisabled hook '{name}'\n\n")),
+                                            style::SetForegroundColor(Color::Reset)
+                                        )?;
+                                    },
+                                    command::HooksSubcommand::EnableAll { global } => {
+                                        context_manager.enable_all_hooks(global).await;
+                                        let message = if global {
+                                            "\nEnabled all global hooks.\n\n".to_string()
+                                        } else {
+                                            format!("\nEnabled all hooks for profile [{}].\n\n", context_manager.current_profile)
+                                        };
+                                        execute!(
+                                            self.output,
+                                            style::SetForegroundColor(Color::Green),
+                                            style::Print(message),
+                                            style::SetForegroundColor(Color::Reset)
+                                        )?;
+                                    },
+                                    command::HooksSubcommand::DisableAll { global } => {
+                                        context_manager.disable_all_hooks(global).await;
+                                        let message = if global {
+                                            "\nDisabled all global hooks.\n\n".to_string()
+                                        } else {
+                                            format!("\nDisabled all hooks for profile [{}].\n\n", context_manager.current_profile)
+                                        };
+                                        execute!(
+                                            self.output,
+                                            style::SetForegroundColor(Color::Green),
+                                            style::Print(format!("\nDisabled all hooks.\n\n")),
                                             style::SetForegroundColor(Color::Reset)
                                         )?;
                                     },
@@ -1116,17 +1153,106 @@ where
                                         execute!(
                                             self.output,
                                             style::Print("\n"),
-                                            style::Print(command::HooksSubcommand::help_text()),
+                                            style::Print(command::ContextSubcommand::hooks_help_text()),
                                             style::Print("\n")
                                         )?;
                                     },
                                 }
                             } else {
-                                execute!(
+                                let global_start_hooks = &context_manager.global_config.hooks.conversation_start;
+                                let global_prompt_hooks = &context_manager.global_config.hooks.per_prompt;
+                                let profile_start_hooks = &context_manager.profile_config.hooks.conversation_start;
+                                let profile_prompt_hooks = &context_manager.profile_config.hooks.per_prompt;
+
+                                queue!(
                                     self.output,
+                                        style::SetForegroundColor(Color::Green),
+                                        style::Print("\nGlobal hooks:\n"),
+                                        style::SetForegroundColor(Color::Cyan),
+                                        style::Print("  Conversation start:\n"),
+                                        style::SetForegroundColor(Color::Reset),
+                                )?;
+
+                                if global_start_hooks.is_empty() {
+                                    queue!(
+                                        self.output,
+                                        style::SetForegroundColor(Color::DarkGrey),
+                                        style::Print("    <none>\n"),
+                                        style::SetForegroundColor(Color::Reset)
+                                    )?;
+                                } else {
+                                    for hook in global_start_hooks {
+                                        let disabled = if !hook.enabled { "(disabled) " } else { "" };
+                                        queue!(self.output, style::Print(format!("    {}{}\n", disabled, hook.name)))?;
+                                    }
+                                }
+
+                                queue!(self.output, 
+                                    style::SetForegroundColor(Color::Cyan),
+                                    style::Print("  Per prompt:\n"),
+                                    style::SetForegroundColor(Color::Reset),
+                                )?;
+
+                                if global_prompt_hooks.is_empty() {
+                                    queue!(
+                                        self.output,
+                                        style::SetForegroundColor(Color::DarkGrey),
+                                        style::Print("    <none>\n"),
+                                        style::SetForegroundColor(Color::Reset)
+                                    )?;
+                                } else {
+                                    for hook in global_prompt_hooks {
+                                        let disabled = if !hook.enabled { "(disabled) " } else { "" };
+                                        queue!(self.output, style::Print(format!("    {}{}\n", disabled, hook.name)))?;
+                                    }
+                                }
+
+                                queue!(
+                                    self.output,
+                                    style::SetForegroundColor(Color::Green),
+                                    style::Print("\nProfile hooks:\n"),
+                                    style::SetForegroundColor(Color::Cyan),
+                                    style::Print("  Conversation start:\n"),
+                                    style::SetForegroundColor(Color::Reset),
+                                )?;
+
+                                if profile_start_hooks.is_empty() {
+                                    queue!(
+                                        self.output,
+                                        style::SetForegroundColor(Color::DarkGrey),
+                                        style::Print("    <none>\n"),
+                                        style::SetForegroundColor(Color::Reset)                                    )?;
+                                } else {
+                                    for hook in profile_start_hooks {
+                                        let disabled = if !hook.enabled { "(disabled) " } else { "" };
+                                        queue!(self.output, style::Print(format!("    {}{}\n", disabled, hook.name)))?;
+                                    }
+                                }
+
+                                queue!(self.output, 
+                                    style::SetForegroundColor(Color::Cyan),
+                                    style::Print("  Per prompt:\n"),
+                                    style::SetForegroundColor(Color::Reset),
+                                )?;
+
+                                if profile_prompt_hooks.is_empty() {
+                                    queue!(
+                                        self.output,
+                                        style::SetForegroundColor(Color::DarkGrey),
+                                        style::Print("    <none>\n"),
+                                        style::SetForegroundColor(Color::Reset)                                    )?;
+                                } else {
+                                    for hook in profile_prompt_hooks {
+                                        let disabled = if !hook.enabled { "(disabled) " } else { "" };
+                                        queue!(self.output, style::Print(format!("    {}{}\n", disabled, hook.name)))?;
+                                    }
+                                }
+
+                                execute!(self.output, 
                                     style::Print("\n"),
-                                    style::Print(format!("print help and current hooks")),
-                                    style::Print("\n")
+                                    style::SetForegroundColor(Color::Green),
+                                    style::Print("Use '/context hooks help' to see commands to add/remove and enable/disable hooks.\n\n"),
+                                    style::SetForegroundColor(Color::Reset),
                                 )?;
                             }
                         },

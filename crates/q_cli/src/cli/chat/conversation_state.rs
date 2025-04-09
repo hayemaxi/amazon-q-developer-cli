@@ -485,7 +485,7 @@ impl ConversationState {
             context_manager.run_per_prompt_hooks(updates).await
         };
         let mut had_results = false;
-        for (name, result, duration) in hook_results {
+        for (name, result) in hook_results {
             match result {
                 Ok(output) => {
                     if !had_results {
@@ -494,9 +494,7 @@ impl ConversationState {
                     }
                     context_content.push_str(&format!("{name}: {output}\n"));
                 },
-                Err(e) => {
-                    // do something
-                }
+                _ => () // TODO: do something with error?
             }
         }
         if !had_results {
