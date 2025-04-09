@@ -17,6 +17,7 @@ pub enum Command {
     Quit,
     Profile { subcommand: ProfileSubcommand },
     Context { subcommand: ContextSubcommand },
+    PromptEditor { initial_text: Option<String> },
     Tools { subcommand: Option<ToolsSubcommand> },
 }
 
@@ -91,19 +92,20 @@ impl ContextSubcommand {
     const ADD_USAGE: &str = "/context add [--global] [--force] <path1> [path2...]";
     const AVAILABLE_COMMANDS: &str = color_print::cstr! {"<cyan!>Available commands</cyan!>
   <em>help</em>                           <black!>Show an explanation for the context command</black!>
-  <em>show [--expand]</em>                <black!>Display current context configuration</black!>
-                                 <black!>Use --expand to list all matched files</black!>
+
+  <em>show [--expand]</em>                <black!>Display the context rule configuration and matched files</black!>
+                                          <black!>--expand: Print out each matched file's content</black!>
 
   <em>add [--global] [--force] <<paths...>></em>
-                                 <black!>Add file(s) to context</black!>
-                                 <black!>--global: Add to global context (available in all profiles)</black!>
-                                 <black!>--force: Add files even if they exceed size limits</black!>
+                                 <black!>Add context rules (filenames or glob patterns)</black!>
+                                 <black!>--global: Add to global rules (available in all profiles)</black!>
+                                 <black!>--force: Include even if matched files exceed size limits</black!>
 
-  <em>rm [--global] <<paths...>></em>       <black!>Remove file(s) from context</black!>
-                                 <black!>--global: Remove from global context</black!>
+  <em>rm [--global] <<paths...>></em>       <black!>Remove specified rules from current profile</black!>
+                                 <black!>--global: Remove specified rules globally</black!>
 
-  <em>clear [--global]</em>               <black!>Clear all files from current context</black!>
-                                 <black!>--global: Clear global context</black!>"};
+  <em>clear [--global]</em>               <black!>Remove all rules from current profile</black!>
+                                 <black!>--global: Remove global rules</black!>"};
     const CLEAR_USAGE: &str = "/context clear [--global]";
     const REMOVE_USAGE: &str = "/context rm [--global] <path1> [path2...]";
     const SHOW_USAGE: &str = "/context show [--expand]";
@@ -115,17 +117,19 @@ impl ContextSubcommand {
     pub fn help_text() -> String {
         color_print::cformat!(
             r#"
-<magenta,em>(Beta) Context Management</magenta,em>
+<magenta,em>(Beta) Context Rule Management</magenta,em>
 
-Context files provide Amazon Q with additional information about your project or environment.
-Adding relevant files to your context helps Amazon Q provide more accurate and helpful responses.
+Context rules determine which files are included in your Amazon Q session. 
+The files matched by these rules provide Amazon Q with additional information 
+about your project or environment. Adding relevant files helps Q generate 
+more accurate and helpful responses.
 
 {}
 
 <cyan!>Notes</cyan!>
 • You can add specific files or use glob patterns (e.g., "*.py", "src/**/*.js")
-• Context files are associated with the current profile
-• Global context files are available across all profiles
+• Profile rules apply only to the current profile
+• Global rules apply across all profiles
 • Context is preserved between chat sessions
 "#,
             Self::AVAILABLE_COMMANDS
@@ -232,6 +236,15 @@ impl Command {
                         subcommand: Some(ToolsSubcommand::TrustAll),
                     }
                 },
+                "editor" => {
+                    if parts.len() > 1 {
+                        Self::PromptEditor {
+                            initial_text: Some(parts[1..].join(" ")),
+                        }
+                    } else {
+                        Self::PromptEditor { initial_text: None }
+                    }
+                },
                 "issue" => {
                     if parts.len() > 1 {
                         Self::Issue {
@@ -316,7 +329,9 @@ impl Command {
                 },
                 "context" => {
                     if parts.len() < 2 {
-                        return Err(ContextSubcommand::usage_msg("Missing subcommand for /context."));
+                        return Ok(Self::Context {
+                            subcommand: ContextSubcommand::Help,
+                        });
                     }
 
                     macro_rules! usage_err {
@@ -330,9 +345,7 @@ impl Command {
 
                     match parts[1].to_lowercase().as_str() {
                         "show" => {
-                            // Parse show command with optional --expand flag
                             let mut expand = false;
-
                             for part in &parts[2..] {
                                 if *part == "--expand" {
                                     expand = true;
@@ -340,7 +353,6 @@ impl Command {
                                     usage_err!(ContextSubcommand::SHOW_USAGE);
                                 }
                             }
-
                             Self::Context {
                                 subcommand: ContextSubcommand::Show { expand },
                             }

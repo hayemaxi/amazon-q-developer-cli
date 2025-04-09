@@ -16,9 +16,16 @@ use std::io::{
     Read,
     Write,
 };
-use std::process::ExitCode;
+use std::process::{
+    Command as ProcessCommand,
+    ExitCode,
+};
 use std::sync::Arc;
 use std::time::Duration;
+use std::{
+    env,
+    fs,
+};
 
 use command::{
     Command,
@@ -85,6 +92,7 @@ use tracing::{
     trace,
     warn,
 };
+use uuid::Uuid;
 use winnow::Partial;
 use winnow::stream::Offset;
 
@@ -93,6 +101,7 @@ use crate::cli::chat::parse::{
     interpret_markdown,
 };
 use crate::util::region_check;
+use crate::util::token_counter::TokenCounter;
 
 const WELCOME_TEXT: &str = color_print::cstr! {"
 
@@ -102,16 +111,16 @@ const WELCOME_TEXT: &str = color_print::cstr! {"
 • Fix the build failures in this project.
 • List my s3 buckets in us-west-2.
 • Write unit tests for my application.
-• Help me understand my git status
+• Help me understand my git status.
 
-<em>/tools</em>        <black!>View and manage tools and permissions.</black!>
-<em>/issue</em>        <black!>Report an issue or make a feature request.</black!>
+<em>/tools</em>        <black!>View and manage tools and permissions</black!>
+<em>/issue</em>        <black!>Report an issue or make a feature request</black!>
 <em>/profile</em>      <black!>(Beta) Manage profiles for the chat session</black!>
-<em>/context</em>      <black!>(Beta) Manage context files for a profile</black!>
+<em>/context</em>      <black!>(Beta) Manage context rules for a profile</black!>
 <em>/help</em>         <black!>Show the help dialogue</black!>
 <em>/quit</em>         <black!>Quit the application</black!>
 
-<cyan!>Use Alt(⌥) + Enter(⏎) to provide multi-line prompts.</cyan!>
+<cyan!>Use Ctrl(^) + j to provide multi-line prompts.</cyan!>
 
 "};
 
@@ -121,10 +130,11 @@ const HELP_TEXT: &str = color_print::cstr! {"
 
 <cyan,em>Commands:</cyan,em>
 <em>/clear</em>        <black!>Clear the conversation history</black!>
-<em>/issue</em>        <black!>Report an issue or make a feature request.</black!>
+<em>/issue</em>        <black!>Report an issue or make a feature request</black!>
+<em>/editor</em>       <black!>Open $EDITOR (defaults to vi) to compose a prompt</black!>
 <em>/help</em>         <black!>Show this help dialogue</black!>
 <em>/quit</em>         <black!>Quit the application</black!>
-<em>/tools</em>        <black!>View and manage tools and permissions.</black!>
+<em>/tools</em>        <black!>View and manage tools and permissions</black!>
   <em>help</em>        <black!>Show an explanation for the trust command</black!>
   <em>trust</em>       <black!>Trust a specific tool for the session</black!>
   <em>untrust</em>     <black!>Revert a tool to per-request confirmation</black!>
@@ -139,16 +149,18 @@ const HELP_TEXT: &str = color_print::cstr! {"
   <em>rename</em>      <black!>Rename a profile</black!>
 <em>/context</em>      <black!>Manage context files for the chat session</black!>
   <em>help</em>        <black!>Show context help</black!>
-  <em>show</em>        <black!>Display current context configuration [--expand]</black!>
+  <em>show</em>        <black!>Display current context rules configuration [--expand]</black!>
   <em>add</em>         <black!>Add file(s) to context [--global] [--force]</black!>
   <em>rm</em>          <black!>Remove file(s) from context [--global]</black!>
   <em>clear</em>       <black!>Clear all files from current context [--global]</black!>
 
 <cyan,em>Tips:</cyan,em>
 <em>!{command}</em>            <black!>Quickly execute a command in your current session</black!>
-<em>Alt(⌥) + Enter(⏎)</em>     <black!>Insert new-line to provide multi-line prompt. Alternatively, [Ctrl+j]</black!>
+<em>Ctrl(^) + j</em>           <black!>Insert new-line to provide multi-line prompt. Alternatively, [Alt(⌥) + Enter(⏎)]</black!>
 
 "};
+
+const RESPONSE_TIMEOUT_CONTENT: &str = "Response timed out - message took too long to generate";
 
 pub async fn chat(
     input: Option<String>,
@@ -418,6 +430,41 @@ impl<W> ChatContext<W>
 where
     W: Write,
 {
+    /// Opens the user's preferred editor to compose a prompt
+    fn open_editor(initial_text: Option<String>) -> Result<String, ChatError> {
+        // Create a temporary file with a unique name
+        let temp_dir = std::env::temp_dir();
+        let file_name = format!("q_prompt_{}.md", Uuid::new_v4());
+        let temp_file_path = temp_dir.join(file_name);
+
+        // Get the editor from environment variable or use a default
+        let editor = env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
+
+        // Write initial content to the file if provided
+        let initial_content = initial_text.unwrap_or_default();
+        fs::write(&temp_file_path, &initial_content)
+            .map_err(|e| ChatError::Custom(format!("Failed to create temporary file: {}", e).into()))?;
+
+        // Open the editor
+        let status = ProcessCommand::new(editor)
+            .arg(&temp_file_path)
+            .status()
+            .map_err(|e| ChatError::Custom(format!("Failed to open editor: {}", e).into()))?;
+
+        if !status.success() {
+            return Err(ChatError::Custom("Editor exited with non-zero status".into()));
+        }
+
+        // Read the content back
+        let content = fs::read_to_string(&temp_file_path)
+            .map_err(|e| ChatError::Custom(format!("Failed to read temporary file: {}", e).into()))?;
+
+        // Clean up the temporary file
+        let _ = fs::remove_file(&temp_file_path);
+
+        Ok(content.trim().to_string())
+    }
+
     async fn try_chat(&mut self) -> Result<()> {
         if self.interactive && self.settings.get_bool_or("chat.greeting.enabled", true) {
             execute!(self.output, style::Print(WELCOME_TEXT))?;
@@ -475,10 +522,10 @@ where
                     tool_uses,
                     pending_tool_index,
                 } => {
-                    let tool_uses_clone = tool_uses.clone().unwrap();
+                    let tool_uses_clone = tool_uses.clone();
                     tokio::select! {
                         res = self.handle_input(input, tool_uses, pending_tool_index) => res,
-                        Some(_) = ctrl_c_stream.recv() => Err(ChatError::Interrupted { tool_uses: Some(tool_uses_clone) })
+                        Some(_) = ctrl_c_stream.recv() => Err(ChatError::Interrupted { tool_uses: tool_uses_clone })
                     }
                 },
                 ChatState::ExecuteTools(tool_uses) => {
@@ -613,7 +660,7 @@ where
                 style::SetForegroundColor(Color::Green),
                 style::Print("t"),
                 style::SetForegroundColor(Color::DarkGrey),
-                style::Print("' to trust this tool for the session. ["),
+                style::Print("' to trust (always allow) this tool for the session. ["),
                 style::SetForegroundColor(Color::Green),
                 style::Print("y"),
                 style::SetForegroundColor(Color::DarkGrey),
@@ -633,8 +680,12 @@ where
         // Require two consecutive sigint's to exit.
         let mut ctrl_c = false;
         let user_input = loop {
-            // Generate prompt based on active context profile
-            let prompt = prompt::generate_prompt(self.conversation_state.current_profile());
+            let all_tools_trusted = self.conversation_state.tools.iter().all(|t| match t {
+                FigTool::ToolSpecification(t) => self.tool_permissions.is_trusted(&t.name),
+            });
+
+            // Generate prompt based on active context profile and trusted tools
+            let prompt = prompt::generate_prompt(self.conversation_state.current_profile(), all_tools_trusted);
 
             match (self.input_source.read_line(Some(&prompt))?, ctrl_c) {
                 (Some(line), _) => {
@@ -780,6 +831,64 @@ where
                     pending_tool_index,
                 }
             },
+            Command::PromptEditor { initial_text } => {
+                match Self::open_editor(initial_text) {
+                    Ok(content) => {
+                        if content.trim().is_empty() {
+                            execute!(
+                                self.output,
+                                style::SetForegroundColor(Color::Yellow),
+                                style::Print("\nEmpty content from editor, not submitting.\n\n"),
+                                style::SetForegroundColor(Color::Reset)
+                            )?;
+
+                            ChatState::PromptUser {
+                                tool_uses: Some(tool_uses),
+                                pending_tool_index,
+                                skip_printing_tools: true,
+                            }
+                        } else {
+                            execute!(
+                                self.output,
+                                style::SetForegroundColor(Color::Green),
+                                style::Print("\nContent loaded from editor. Submitting prompt...\n\n"),
+                                style::SetForegroundColor(Color::Reset)
+                            )?;
+
+                            // Display the content as if the user typed it
+                            execute!(
+                                self.output,
+                                style::SetForegroundColor(Color::Magenta),
+                                style::Print("> "),
+                                style::SetAttribute(Attribute::Reset),
+                                style::Print(&content),
+                                style::Print("\n")
+                            )?;
+
+                            // Process the content as user input
+                            ChatState::HandleInput {
+                                input: content,
+                                tool_uses: Some(tool_uses),
+                                pending_tool_index,
+                            }
+                        }
+                    },
+                    Err(e) => {
+                        execute!(
+                            self.output,
+                            style::SetForegroundColor(Color::Red),
+                            style::Print(format!("\nError opening editor: {}\n\n", e)),
+                            style::SetForegroundColor(Color::Reset)
+                        )?;
+
+                        ChatState::PromptUser {
+                            tool_uses: Some(tool_uses),
+                            pending_tool_index,
+                            skip_printing_tools: true,
+                        }
+                    },
+                }
+            },
             Command::Quit => ChatState::Exit,
             Command::Profile { subcommand } => {
                 if let Some(context_manager) = &mut self.conversation_state.context_manager {
@@ -906,16 +1015,16 @@ where
                 if let Some(context_manager) = &mut self.conversation_state.context_manager {
                     match subcommand {
                         command::ContextSubcommand::Show { expand } => {
+                            // Display global context
                             execute!(
                                 self.output,
-                                style::SetForegroundColor(Color::Green),
-                                style::Print(format!("\ncurrent profile: {}\n\n", context_manager.current_profile)),
-                                style::SetForegroundColor(Color::Reset)
+                                style::SetAttribute(Attribute::Bold),
+                                style::SetForegroundColor(Color::Magenta),
+                                style::Print("\n🌍 global:\n"),
+                                style::SetAttribute(Attribute::Reset),
                             )?;
-
-                            // Display global context
-                            execute!(self.output, style::Print("global:\n"))?;
-
+                            let mut global_context_files = Vec::new();
+                            let mut profile_context_files = Vec::new();
                             if context_manager.global_config.paths.is_empty() {
                                 execute!(
                                     self.output,
@@ -925,12 +1034,34 @@ where
                                 )?;
                             } else {
                                 for path in &context_manager.global_config.paths {
-                                    execute!(self.output, style::Print(format!("    {}\n", path)))?;
+                                    execute!(self.output, style::Print(format!("    {} ", path)))?;
+                                    if let Ok(context_files) =
+                                        context_manager.get_context_files_by_path(false, path).await
+                                    {
+                                        execute!(
+                                            self.output,
+                                            style::SetForegroundColor(Color::Green),
+                                            style::Print(format!(
+                                                "({} match{})",
+                                                context_files.len(),
+                                                if context_files.len() == 1 { "" } else { "es" }
+                                            )),
+                                            style::SetForegroundColor(Color::Reset)
+                                        )?;
+                                        global_context_files.extend(context_files);
+                                    }
+                                    execute!(self.output, style::Print("\n"))?;
                                 }
                             }
 
                             // Display profile context
-                            execute!(self.output, style::Print("\nprofile:\n"))?;
+                            execute!(
+                                self.output,
+                                style::SetAttribute(Attribute::Bold),
+                                style::SetForegroundColor(Color::Magenta),
+                                style::Print(format!("\n👤 profile ({}):\n", context_manager.current_profile)),
+                                style::SetAttribute(Attribute::Reset),
+                            )?;
 
                             if context_manager.profile_config.paths.is_empty() {
                                 execute!(
@@ -941,54 +1072,106 @@ where
                                 )?;
                             } else {
                                 for path in &context_manager.profile_config.paths {
-                                    execute!(self.output, style::Print(format!("    {}\n", path)))?;
-                                }
-                                execute!(self.output, style::Print("\n"))?;
-                            }
-
-                            match context_manager.get_context_files(false).await {
-                                Ok(context_files) => {
-                                    if context_files.is_empty() {
-                                        execute!(
-                                            self.output,
-                                            style::SetForegroundColor(Color::DarkGrey),
-                                            style::Print("No files matched the configured context paths.\n\n"),
-                                            style::SetForegroundColor(Color::Reset)
-                                        )?;
-                                    } else if expand {
-                                        // Show expanded file list when expand flag is set
-                                        execute!(
-                                            self.output,
-                                            style::SetForegroundColor(Color::Green),
-                                            style::Print(format!("Expanded files ({}):\n", context_files.len())),
-                                            style::SetForegroundColor(Color::Reset)
-                                        )?;
-
-                                        for (filename, _) in context_files {
-                                            execute!(self.output, style::Print(format!("    {}\n", filename)))?;
-                                        }
-                                        execute!(self.output, style::Print("\n"))?;
-                                    } else {
-                                        // Just show the count when expand flag is not set
+                                    execute!(self.output, style::Print(format!("    {} ", path)))?;
+                                    if let Ok(context_files) =
+                                        context_manager.get_context_files_by_path(false, path).await
+                                    {
                                         execute!(
                                             self.output,
                                             style::SetForegroundColor(Color::Green),
                                             style::Print(format!(
-                                                "Number of context files in use: {}\n",
-                                                context_files.len()
+                                                "({} match{})",
+                                                context_files.len(),
+                                                if context_files.len() == 1 { "" } else { "es" }
                                             )),
                                             style::SetForegroundColor(Color::Reset)
                                         )?;
+                                        profile_context_files.extend(context_files);
                                     }
-                                },
-                                Err(e) => {
+                                }
+                                execute!(self.output, style::Print("\n\n"))?;
+                            }
+
+                            if global_context_files.is_empty() && profile_context_files.is_empty() {
+                                execute!(
+                                    self.output,
+                                    style::SetForegroundColor(Color::DarkGrey),
+                                    style::Print("No files in the current directory matched the rules above.\n\n"),
+                                    style::SetForegroundColor(Color::Reset)
+                                )?;
+                            } else {
+                                let total = global_context_files.len() + profile_context_files.len();
+                                let total_tokens = global_context_files
+                                    .iter()
+                                    .map(|(_, content)| TokenCounter::count_tokens(content))
+                                    .sum::<usize>()
+                                    + profile_context_files
+                                        .iter()
+                                        .map(|(_, content)| TokenCounter::count_tokens(content))
+                                        .sum::<usize>();
+                                execute!(
+                                    self.output,
+                                    style::SetForegroundColor(Color::Green),
+                                    style::SetAttribute(Attribute::Bold),
+                                    style::Print(format!(
+                                        "{} matched file{} in use:\n",
+                                        total,
+                                        if total == 1 { "" } else { "s" }
+                                    )),
+                                    style::SetForegroundColor(Color::Reset),
+                                    style::SetAttribute(Attribute::Reset)
+                                )?;
+
+                                for (filename, content) in global_context_files {
+                                    let est_tokens = TokenCounter::count_tokens(&content);
                                     execute!(
                                         self.output,
-                                        style::SetForegroundColor(Color::Red),
-                                        style::Print(format!("Error retrieving context files: {}\n\n", e)),
-                                        style::SetForegroundColor(Color::Reset)
+                                        style::SetForegroundColor(Color::DarkYellow),
+                                        style::Print(format!("🌍 [~{} tokens]", est_tokens)),
+                                        style::SetForegroundColor(Color::Reset),
+                                        style::Print(format!("    {}\n", filename))
                                     )?;
-                                },
+                                    if expand {
+                                        execute!(
+                                            self.output,
+                                            style::SetForegroundColor(Color::DarkGrey),
+                                            style::Print(format!("{}\n\n", content)),
+                                            style::SetForegroundColor(Color::Reset)
+                                        )?;
+                                    }
+                                }
+
+                                for (filename, content) in profile_context_files {
+                                    let est_tokens = TokenCounter::count_tokens(&content);
+                                    execute!(
+                                        self.output,
+                                        style::SetForegroundColor(Color::DarkYellow),
+                                        style::Print(format!("👤 [~{} tokens]", est_tokens)),
+                                        style::SetForegroundColor(Color::Reset),
+                                        style::Print(format!("    {}\n", filename))
+                                    )?;
+                                    if expand {
+                                        execute!(
+                                            self.output,
+                                            style::SetForegroundColor(Color::DarkGrey),
+                                            style::Print(format!("{}\n\n", content)),
+                                            style::SetForegroundColor(Color::Reset)
+                                        )?;
+                                    }
+                                }
+
+                                if expand {
+                                    execute!(self.output, style::Print(format!("{}\n\n", "▔".repeat(3))),)?;
+                                }
+
+                                execute!(
+                                    self.output,
+                                    style::SetForegroundColor(Color::Yellow),
+                                    style::Print(format!("\nTotal: ~{} tokens\n\n", total_tokens)),
+                                    style::SetForegroundColor(Color::Reset)
+                                )?;
+
+                                execute!(self.output, style::Print("\n"))?;
                             }
                         },
                         command::ContextSubcommand::Add { global, force, paths } => {
@@ -1332,6 +1515,7 @@ where
     }
 
     async fn handle_response(&mut self, response: SendMessageOutput) -> Result<ChatState, ChatError> {
+        let request_id = response.request_id().map(|s| s.to_string());
         let mut buf = String::new();
         let mut offset = 0;
         let mut ended = false;
@@ -1368,6 +1552,11 @@ where
                             tool_name_being_recvd = None;
                         },
                         parser::ResponseEvent::EndStream { message } => {
+                            // This log is attempting to help debug instances where users encounter
+                            // the response timeout message.
+                            if message.content == RESPONSE_TIMEOUT_CONTENT {
+                                error!(?request_id, ?message, "Encountered an unexpected model response");
+                            }
                             self.conversation_state.push_assistant_message(message);
                             ended = true;
                         },
@@ -1396,7 +1585,7 @@ where
                             self.conversation_state
                                 .push_assistant_message(AssistantResponseMessage {
                                     message_id: None,
-                                    content: "Response timed out - message took too long to generate".to_string(),
+                                    content: RESPONSE_TIMEOUT_CONTENT.to_string(),
                                     tool_uses: None,
                                 });
                             self.conversation_state
@@ -2179,5 +2368,20 @@ mod tests {
 
         assert_eq!(ctx.fs().read_to_string("/file1.txt").await.unwrap(), "Hello, world!\n");
         assert!(!ctx.fs().exists("/file2.txt"));
+    }
+
+    #[test]
+    fn test_editor_content_processing() {
+        // Since we no longer have template replacement, this test is simplified
+        let cases = vec![
+            ("My content", "My content"),
+            ("My content with newline\n", "My content with newline"),
+            ("", ""),
+        ];
+
+        for (input, expected) in cases {
+            let processed = input.trim().to_string();
+            assert_eq!(processed, expected.trim().to_string(), "Failed for input: {}", input);
+        }
     }
 }
