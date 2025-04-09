@@ -1,7 +1,30 @@
+use std::{collections::{HashMap, HashSet}, io::Write, sync::Arc, time::{Duration, Instant}};
+
 use serde::{
     Deserialize,
     Serialize,
 };
+use clap::ValueEnum;
+use tokio::sync::RwLock;
+use eyre::{
+    Result,
+    eyre,
+};
+
+use crossterm::style::{
+    Attribute,
+    Color,
+    Stylize,
+};
+use crossterm::{
+    cursor,
+    execute,
+    queue,
+    style,
+    terminal,
+};
+
+use super::tools::execute_bash::run_command;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -10,7 +33,7 @@ pub enum HookType {
     // Addtional hooks as necessary
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum Criticality {
     Fail,    // Hook failure will prevent prompt from being sent
@@ -33,8 +56,354 @@ pub struct Hook {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HookConfig {
-    pub conversation_start: Option<Vec<Hook>>,
-    pub per_prompt: Option<Vec<Hook>>,
+    pub conversation_start: Vec<Hook>,
+    pub per_prompt: Vec<Hook>,
+}
+
+impl Default for HookConfig {
+    fn default() -> Self {
+        Self {
+            conversation_start: Vec::new(),
+            per_prompt: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct HookExecutor {
+    cache_conversation_start: Arc<RwLock<HashMap<String, (String, Instant)>>>,
+    cache_per_prompt: Arc<RwLock<HashMap<String, (String, Instant)>>>,
+    pub disabled_hooks: HashSet<String>,
+}
+
+impl HookExecutor {
+    pub fn new() -> Self {
+        Self {
+            cache_conversation_start: Arc::new(RwLock::new(HashMap::new())),
+            cache_per_prompt: Arc::new(RwLock::new(HashMap::new())),
+            disabled_hooks: HashSet::new(),
+        }
+    }
+
+    pub async fn run_hooks(&self, hooks: Vec<&Hook>, conversation_start: bool, updates: &mut impl Write) -> Vec<(String, Result<String>)> {
+        let mut futures = Vec::new();
+        // Start hooks
+        for hook in hooks {
+            futures.push(self.execute_hook(hook, conversation_start));
+        }
+
+        if futures.is_empty() {
+            return Vec::new();
+        }
+
+        execute!(
+            updates,
+            style::SetForegroundColor(Color::Green),
+            style::Print(format!("\n\nRunning {} hooks . . . ", futures.len())),
+        );
+    
+        // Wait for results
+        let results = futures::future::join_all(futures).await;
+
+        // Output time data.
+        let total_duration = format!("{:.3}s", results.iter().map(|r| r.2).sum::<Duration>().as_secs_f64());
+        queue!(
+            updates,
+            style::SetForegroundColor(Color::Green),
+            style::Print(format!("completed in {} ms\n\n", total_duration)),
+            style::SetForegroundColor(Color::Reset),
+        );
+
+        for r in &results {
+            match r.1 {
+                Ok(result) => {
+                    if !result.is_empty() {
+                        queue!(
+                            updates,
+                            style::Print(format!("{}: ", r.0)),
+                            style::Print(result),
+                            style::Print("\n"),
+                        );
+                    }
+                },
+                Err(e) => {
+                    queue!(
+                        updates,
+                        style::SetForegroundColor(Color::Red),
+                        style::Print(format!("{}: ", r.0)),
+                        style::Print(format!("Error: {}", e)),
+                        style::Print("\n"),
+                    );
+                }
+            }
+        }
+
+        results.into_iter().map(|r| (r.0, r.1)).collect()
+    }
+    async fn execute_hook(&self, hook: &Hook, conversation_start: bool) -> (String, Result<String>, Duration) {
+        let start_time = Instant::now();
+
+        // Check cache for existing value
+        if let Some(cached_value) = self.get_cache(&hook.name, conversation_start).await {
+            return (
+                hook.name.clone(),
+                Ok(cached_value),
+                Duration::from_secs(0),
+            );
+        }
+
+        // Cache miss or expired - execute hook
+        let result = match hook.r#type {
+            HookType::Inline => self.execute_inline_hook(hook).await,
+        };
+
+        // If execution was successful, update cache
+        if let Ok(value) = &result {
+            self.insert_cache(&hook.name, conversation_start, value.clone(), Instant::now() + Duration::from_secs(hook.cache_ttl_seconds.unwrap_or(0))).await;
+        }
+
+        (hook.name.clone(), result, start_time.elapsed())
+    }
+
+    async fn execute_inline_hook(&self, hook: &Hook) -> Result<String> {
+        let command = hook.command.as_ref().expect("command required for inline hooks");
+        let command_future = run_command(
+            command,
+            hook.max_output_size.unwrap_or(1024*10), 
+            None::<std::io::Stdout>
+        );
+        let timeout = Duration::from_millis(hook.timeout_ms.unwrap_or(10000));
+
+        // Run with timeout
+        match tokio::time::timeout(timeout, command_future).await {
+            Ok(result) => {
+                match result {
+                    Ok(result) => {
+                        let exit_status = result.exit_status.unwrap_or(0);
+                        if exit_status != 0 {
+                            // Handle command failure based on criticality
+                            match hook.criticality.clone().unwrap_or(Criticality::Warn) {
+                                Criticality::Fail => {
+                                    return Err(eyre!("Command failed with status: {}", exit_status));
+                                },
+                                Criticality::Warn => {
+                                    println!("Warning: Hook '{}' failed with status: {}", hook.name, exit_status);
+                                    return Ok(format!("# Warning: Hook '{}' failed with status: {}", 
+                                        hook.name, exit_status));
+                                },
+                                Criticality::Ignore => {
+                                    return Ok(String::new());
+                                }
+                            }
+                        } else{
+                            Ok(result.stdout)
+                        }
+                    },
+                    Err(_) => {
+                        return Err(eyre!("Hook timed out after {:?}", timeout));
+                    },
+                
+                }
+            },
+            Err(_) => {
+                // Handle timeout based on criticality
+                match hook.criticality.clone().unwrap_or(Criticality::Warn) {
+                    Criticality::Fail => {
+                        return Err(eyre!("Hook timed out after {:?}", timeout));
+                    },
+                    Criticality::Warn => {
+                        println!("Warning: Hook '{}' timed out after {:?}", hook.name, timeout);
+                        return Ok(format!("# Warning: Hook '{}' timed out", hook.name));
+                    },
+                    Criticality::Ignore => {
+                        return Ok(String::new());
+                    }
+                }
+            }
+        }
+    }
+    
+    // pub async fn execute_conversation_start_hooks(&self) -> Result<Vec<ContextEntry>> {
+    //     // Get enabled conversation start hooks
+    //     let hooks = self.config_manager.get_conversation_start_hooks();
+    //     let mut context_entries = Vec::new();
+        
+    //     // Create futures for all hooks to run in parallel
+    //     let mut futures = Vec::new();
+    //     for hook in hooks {
+    //         if !self.hook_registry.is_hook_enabled(&hook.name) {
+    //             continue;
+    //         }
+            
+    //         let hook_clone = hook.clone();
+    //         let self_clone = self.clone();
+    //         futures.push(async move {
+    //             (hook_clone.name.clone(), self_clone.execute_hook(&hook_clone).await)
+    //         });
+    //     }
+        
+    //     // Wait for all hooks to complete
+    //     let results = futures::future::join_all(futures).await;
+        
+    //     // Process results
+    //     for (name, result) in results {
+    //         match result {
+    //             Ok(output) => {
+    //                 // Format output as context entry
+    //                 let entry = ContextEntry::new(
+    //                     format!("hook:{}", name),
+    //                     output,
+    //                     ContextSource::Hook(name),
+    //                 );
+    //                 context_entries.push(entry);
+    //             }
+    //             Err(e) => {
+    //                 println!("Hook {} failed: {}", name, e);
+    //             }
+    //         }
+    //     }
+        
+    //     Ok(context_entries)
+    // }
+
+    // pub async fn execute_per_prompt_hooks(&self) -> Result<Vec<ContextEntry>> {
+    //     // Similar to execute_conversation_start_hooks but for per-prompt hooks
+    //     // Get enabled per-prompt hooks
+    //     let hooks = self.config_manager.get_per_prompt_hooks();
+    //     let mut context_entries = Vec::new();
+        
+    //     // Create futures for all hooks to run in parallel
+    //     let mut futures = Vec::new();
+    //     for hook in hooks {
+    //         if !self.hook_registry.is_hook_enabled(&hook.name) {
+    //             continue;
+    //         }
+            
+    //         println!("Running hook: {}...", hook.name);
+    //         let start_time = Instant::now();
+            
+    //         match self.execute_hook(hook).await {
+    //             Ok(output) => {
+    //                 let elapsed = start_time.elapsed();
+    //                 println!("Hook {} completed in {:?}", hook.name, elapsed);
+                    
+    //                 // Format output as context entry
+    //                 let entry = ContextEntry::new(
+    //                     format!("hook:{}", hook.name),
+    //                     output,
+    //                     ContextSource::Hook(hook.name.clone()),
+    //                 );
+    //                 context_entries.push(entry);
+    //             }
+    //             Err(e) => {
+    //                 println!("Hook {} failed: {}", hook.name, e);
+    //             }
+    //         }
+    //     }
+        
+    //     Ok(context_entries)
+    // }
+
+    // async fn execute_inline_hook(&self, hook: &HookConfig) -> Result<String> {
+    //     // Check cache first if TTL is set
+    //     if let Some(ttl) = hook.cache_ttl_seconds {
+    //         if let Some(cached_result) = self.cache.get(&hook.name) {
+    //             if cached_result.timestamp.elapsed().as_secs() < ttl {
+    //                 return Ok(cached_result.output.clone());
+    //             }
+    //         }
+    //     }
+        
+    //     // Execute hook.command in shell using tokio::process::Command
+    //     let start = Instant::now();
+        
+    //     // Create a future with timeout
+    //     let timeout_duration = Duration::from_millis(hook.timeout_ms.unwrap_or(5000));
+    //     let command_future = async {
+    //         Command::new("sh")
+    //             .arg("-c")
+    //             .arg(&hook.command.as_ref().unwrap())
+    //             .output()
+    //             .await
+    //     };
+        
+    //     // Run with timeout
+    //     let output = match tokio::time::timeout(timeout_duration, command_future).await {
+    //         Ok(result) => result?,
+    //         Err(_) => {
+    //             // Handle timeout based on criticality
+    //             match hook.criticality {
+    //                 Criticality::Fail => {
+    //                     return Err(anyhow!("Hook timed out after {:?}", timeout_duration));
+    //                 },
+    //                 Criticality::Warn => {
+    //                     println!("Warning: Hook '{}' timed out after {:?}", hook.name, timeout_duration);
+    //                     return Ok(format!("# Warning: Hook '{}' timed out", hook.name));
+    //                 },
+    //                 Criticality::Ignore => {
+    //                     return Ok(String::new());
+    //                 }
+    //             }
+    //         }
+    //     };
+            
+    //     if !output.status.success() {
+    //         // Handle command failure based on criticality
+    //         match hook.criticality {
+    //             Criticality::Fail => {
+    //                 return Err(anyhow!("Command failed with status: {}", output.status));
+    //             },
+    //             Criticality::Warn => {
+    //                 println!("Warning: Hook '{}' failed with status: {}", hook.name, output.status);
+    //                 return Ok(format!("# Warning: Hook '{}' failed with status: {}", 
+    //                     hook.name, output.status));
+    //             },
+    //             Criticality::Ignore => {
+    //                 return Ok(String::new());
+    //             }
+    //         }
+    //     }
+        
+    //     // Capture stdout and handle errors
+    //     let stdout = String::from_utf8(output.stdout)?;
+        
+    //     // Apply size limits if configured
+    //     if let Some(max_size) = hook.max_output_size {
+    //         if stdout.len() > max_size {
+    //             return Ok(format!("{}\n... (output truncated, exceeded {} bytes)", 
+    //                 &stdout[..max_size], max_size));
+    //         }
+    //     }
+        
+    //     Ok(stdout)
+    //     // Handle errors and timeouts
+    // }
+
+    async fn get_cache(&self, name: &str, conversation_start: bool) -> Option<String> {
+        let cache = if conversation_start {
+            &self.cache_conversation_start
+        } else {
+            &self.cache_per_prompt
+        };
+
+        cache.read().await.get(name).and_then(|(value, expiry)| {
+            if Instant::now() < *expiry {
+                Some(value.clone())
+            } else {
+                None
+            }
+        })
+    }
+
+    async fn insert_cache(&self, name: &str, conversation_start: bool, output: String, expiry: Instant) {
+        let cache = if conversation_start {
+            &self.cache_conversation_start
+        } else {
+            &self.cache_per_prompt
+        };
+
+        cache.write().await.insert(name.to_string(), (output, expiry));
+    }
 }
 
 // pub struct InlineHook {

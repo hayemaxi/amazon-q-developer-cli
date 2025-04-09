@@ -1,4 +1,5 @@
 use std::io::Write;
+use clap::{Parser, Subcommand};
 
 use crossterm::style::Color;
 use crossterm::{
@@ -69,16 +70,77 @@ Profiles allow you to organize and manage different sets of context files for di
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum HooksSubCommand {
-    Add { name: String, r#type: String, command: String, cache_ttl_seconds: u64, timeout_ms: u64, criticality: Criticality },
-    Remove { name: String },
-    Enable { name: String },
-    Disable { name: String },
+#[derive(Parser, Debug, Clone)]
+#[command(name = "hooks", disable_help_subcommand = true)]
+struct HooksCommand {
+    #[command(subcommand)]
+    command: HooksSubcommand,
+}
+
+#[derive(Subcommand, Debug, Clone, Eq, PartialEq)]
+pub enum HooksSubcommand {
+    /// Add a new hook
+    Add {
+        /// Name of the hook
+        #[arg(long)]
+        name: String,
+        
+        /// Type of the hook
+        #[arg(long)]
+        r#type: String,
+        
+        /// Command to execute
+        #[arg(long)]
+        command: Option<String>,
+        
+        /// Cache TTL in seconds
+        #[arg(long, default_value = "0")]
+        cache_ttl_seconds:  Option<u64>,
+        
+        /// Timeout in milliseconds
+        #[arg(long, default_value = "0")]
+        timeout_ms:  Option<u64>,
+        
+        /// Criticality level (fail, warn, ignore)
+        #[arg(long, default_value = "ignore")]
+        criticality:  Option<Criticality>,
+    },
+    /// Remove a hook
+    Remove {
+        /// Name of the hook to remove
+        #[arg(long)]
+        name: String,
+    },
+    /// Enable a specific hook
+    Enable {
+        /// Name of the hook to enable
+        #[arg(long)]
+        name: String,
+    },
+    /// Disable a specific hook
+    Disable {
+        /// Name of the hook to disable
+        #[arg(long)]
+        name: String,
+    },
+    /// Enable all hooks
     EnableAll,
+    /// Disable all hooks
     DisableAll,
+    /// Display help information
     Help,
 }
+
+// #[derive(Debug, Clone, PartialEq, Eq)]
+// pub enum HooksSubcommand {
+//     Add { name: String, r#type: String, command: String, cache_ttl_seconds: u64, timeout_ms: u64, criticality: Criticality },
+//     Remove { name: String },
+//     Enable { name: String },
+//     Disable { name: String },
+//     EnableAll,
+//     DisableAll,
+//     Help,
+// }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ContextSubcommand {
@@ -98,7 +160,7 @@ pub enum ContextSubcommand {
         global: bool,
     },
     Hooks {
-        subcommand: HooksSubCommand,
+        subcommand: Option<HooksSubcommand>,
     },
     Help,
 }
@@ -426,23 +488,20 @@ impl Command {
                             subcommand: ContextSubcommand::Help,
                         },
                         "hooks" => {
-                            // now start handling subcommands manually wih strings
-                            for part in &parts[2..] {
-                                if *part == "--global" {
-                                    global = true;
-                                } else {
-                                    paths.push((*part).to_string());
-                                }
-                            }
+                            if parts.get(2).is_none() {
+                                return Ok(Self::Context {
+                                    subcommand: ContextSubcommand::Hooks {
+                                        subcommand: None,
+                                    },
+                                });
+                            };
 
-                            if paths.is_empty() {
-                                usage_err!(ContextSubcommand::REMOVE_USAGE);
+                            match Self::parse_hooks(&parts) {
+                                Ok(command) => command,
+                                Err(err) => return Err(ContextSubcommand::usage_msg(format!("Unknown subcommand '{}'.", err))),
+                            
                             }
-
-                            Self::Context {
-                                subcommand: ContextSubcommand::Remove { global, paths },
-                            },
-                        }
+                        },
                         other => {
                             return Err(ContextSubcommand::usage_msg(format!("Unknown subcommand '{}'.", other)));
                         },
@@ -517,6 +576,159 @@ impl Command {
             prompt: input.to_string(),
         })
     }
+
+    fn parse_hooks(parts: &Vec<&str>) -> Result<Self, String> {
+        // Skip the first two parts ("/context" and "hooks")
+        let args = parts[1..].join(" ");
+        
+        // Parse with Clap
+        match HooksCommand::try_parse_from(args.split_whitespace()) {
+            Ok(hooks_command) => {
+                // Convert Clap command to your internal Command enum
+                let subcommand = match hooks_command.command {
+                    HooksSubcommand::Add { name, r#type, command, cache_ttl_seconds, timeout_ms, criticality } => {
+                        Some(HooksSubcommand::Add {
+                            name,
+                            r#type,
+                            command,
+                            cache_ttl_seconds,
+                            timeout_ms,
+                            criticality,
+                        })
+                    },
+                    HooksSubcommand::Remove { name } => {
+                        Some(HooksSubcommand::Remove { name })
+                    },
+                    HooksSubcommand::Enable { name } => {
+                        Some(HooksSubcommand::Enable { name })
+                    },
+                    HooksSubcommand::Disable { name } => {
+                        Some(HooksSubcommand::Disable { name })
+                    },
+                    HooksSubcommand::EnableAll => Some(HooksSubcommand::EnableAll),
+                    HooksSubcommand::DisableAll => Some(HooksSubcommand::DisableAll),
+                    HooksSubcommand::Help => Some(HooksSubcommand::Help),
+                };
+                
+                Ok(Self::Context {
+                    subcommand: ContextSubcommand::Hooks { subcommand }
+                })
+            },
+            Err(e) => Err(e.to_string()),
+        }
+    }
+    
+
+    // fn _parse_hooks(parts: &Vec<&str>, subcommand: &str) -> Self {
+    //     match subcommand {
+    //         "add" => {
+    //             let mut name = String::new();
+    //             let mut r#type = String::new();
+    //             let mut command = String::new();
+    //             let mut cache_ttl_seconds = 0;
+    //             let mut timeout_ms = 0;
+    //             let mut criticality = Criticality::Ignore;
+
+    //             let mut i = 3;
+    //             while i < parts.len() {
+    //                 match parts[i] {
+    //                     "--name" => {
+    //                         if let Some(val) = parts.get(i + 1) {
+    //                             name = val.to_string();
+    //                             i += 2;
+    //                         }
+    //                     }
+    //                     "--type" => {
+    //                         if let Some(val) = parts.get(i + 1) {
+    //                             r#type = val.to_string();
+    //                             i += 2;
+    //                         }
+    //                     }
+    //                     "--command" => {
+    //                         if let Some(val) = parts.get(i + 1) {
+    //                             command = val.to_string();
+    //                             i += 2;
+    //                         }
+    //                     }
+    //                     "--cache-ttl" => {
+    //                         if let Some(val) = parts.get(i + 1) {
+    //                             if let Ok(ttl) = val.parse() {
+    //                                 cache_ttl_seconds = ttl;
+    //                                 i += 2;
+    //                             }
+    //                         }
+    //                     }
+    //                     "--timeout" => {
+    //                         if let Some(val) = parts.get(i + 1) {
+    //                             if let Ok(timeout) = val.parse() {
+    //                                 timeout_ms = timeout;
+    //                                 i += 2;
+    //                             }
+    //                         }
+    //                     }
+    //                     "--criticality" => {
+    //                         if let Some(val) = parts.get(i + 1) {
+    //                             criticality = match val.to_lowercase().as_str() {
+    //                                 "fail" => Criticality::Fail,
+    //                                 "warn" => Criticality::Warn,
+    //                                 "ignore" => Criticality::Ignore,
+    //                                 _ => (),
+    //                             };
+    //                             i += 2;
+    //                         }
+    //                     }
+    //                     _ => i += 1
+    //                 }
+    //             }
+
+    //             Self::Context {
+    //                 subcommand: ContextSubcommand::Hooks {
+    //                     subcommand: Some(HooksSubcommand::Add {
+    //                         name,
+    //                         r#type,
+    //                         command,
+    //                         cache_ttl_seconds,
+    //                         timeout_ms,
+    //                         criticality
+    //                     })
+    //                 }
+    //             }
+    //         },
+    //         "rm" => {
+    //             let name = parts.get(3).map(|s| s.to_string())
+    //                 .ok_or_else(|| "Hook name required".to_string())?;
+                
+    //             Self::Context {
+    //                 subcommand: ContextSubcommand::Hooks {
+    //                     subcommand: Some(HooksSubcommand::Remove { name })
+    //                 }
+    //             }
+    //         },
+    //         "enable-all" => {
+    //             Self::Context {
+    //                 subcommand: ContextSubcommand::Hooks {
+    //                     subcommand: Some(HooksSubcommand::EnableAll)
+    //                 }
+    //             }
+    //         },
+    //         "disable-all" => {
+    //             Self::Context {
+    //                 subcommand: ContextSubcommand::Hooks {
+    //                     subcommand: Some(HooksSubcommand::DisableAll)
+    //                 }
+    //             }
+    //         },
+    //         "help" => {
+    //             Self::Context {
+    //                 subcommand: ContextSubcommand::Hooks {
+    //                     subcommand: Some(HooksSubcommand::Help),
+    //                 },
+    //             }
+    //         },
+    //         _ => usage_err!(ContextSubcommand::HOOKS_USAGE),
+    //     }
+    // }
+
 }
 
 #[cfg(test)]

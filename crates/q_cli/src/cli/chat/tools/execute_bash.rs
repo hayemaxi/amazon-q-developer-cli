@@ -82,11 +82,11 @@ impl ExecuteBash {
     }
 
     pub async fn invoke(&self, updates: impl Write) -> Result<InvokeOutput> {
-        let output =  run_command(&self.command, MAX_TOOL_RESPONSE_SIZE, Some(updates)).await?;
+        let output =  run_command(&self.command, MAX_TOOL_RESPONSE_SIZE / 3, Some(updates)).await?;
         let result = serde_json::json!({
-            "exit_status": output.0.unwrap_or(0).to_string(),
-            "stdout": output.1,
-            "stderr": output.2,
+            "exit_status": output.exit_status.unwrap_or(0).to_string(),
+            "stdout": output.stdout,
+            "stderr": output.stderr,
         });
 
         Ok(InvokeOutput {
@@ -116,7 +116,14 @@ impl ExecuteBash {
     }
 }
 
-pub async fn run_command<W: Write>(command: &str, max_result_size: usize, mut updates: Option<W>) -> Result<(Option<i32>, String, String)> {
+// Tuple where 0: exit code, 1: stdout, 2: stderr
+struct RunResult {
+    pub exit_status: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+pub async fn run_command<W: Write>(command: &str, max_result_size: usize, mut updates: Option<W>) -> Result<RunResult> {
     // We need to maintain a handle on stderr and stdout, but pipe it to the terminal as well
     let mut child = tokio::process::Command::new("bash")
         .arg("-c")
@@ -184,25 +191,25 @@ pub async fn run_command<W: Write>(command: &str, max_result_size: usize, mut up
     let stdout = stdout_buf.into_iter().collect::<Vec<_>>().join("\n");
     let stderr = stderr_buf.into_iter().collect::<Vec<_>>().join("\n");
 
-    Ok((exit_status.code(), format!(
+    Ok(RunResult { exit_status: exit_status.code(), stdout: format!(
             "{}{}",
-            truncate_safe(&stdout, max_result_size / 3),
-            if stdout.len() > max_result_size / 3 {
+            truncate_safe(&stdout, max_result_size),
+            if stdout.len() > max_result_size {
                 " ... truncated"
             } else {
                 ""
             }
         ),
-    format!(
+    stderr: format!(
             "{}{}",
-            truncate_safe(&stderr, max_result_size / 3),
-            if stderr.len() > max_result_size / 3 {
+            truncate_safe(&stderr, max_result_size),
+            if stderr.len() > max_result_size {
                 " ... truncated"
             } else {
                 ""
             }
         ),
-    ))
+    })
 }
 
 #[cfg(test)]

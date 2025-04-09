@@ -3,6 +3,7 @@ use std::collections::{
     VecDeque,
 };
 use std::env;
+use std::io::Write;
 use std::sync::Arc;
 
 use fig_api_client::model::{
@@ -122,7 +123,7 @@ impl ConversationState {
         self.history.clear();
     }
 
-    pub async fn append_new_user_message(&mut self, input: String) {
+    pub async fn append_new_user_message(&mut self, input: String, updates: &mut impl Write) {
         debug_assert!(self.next_message.is_none(), "next_message should not exist");
         if let Some(next_message) = self.next_message.as_ref() {
             warn!(?next_message, "next_message should not exist");
@@ -153,7 +154,7 @@ impl ConversationState {
         }
 
         // Context from hooks (scripts, commands, tools)
-        if let Some(hook_context) = self.get_hook_context(false).await {
+        if let Some(hook_context) = self.get_hook_context(false, updates).await {
             context_content.push_str(&hook_context);
         }
 
@@ -384,14 +385,14 @@ impl ConversationState {
     /// Returns a [FigConversationState] capable of being sent by
     /// [fig_api_client::StreamingClient] while preparing the current conversation state to be sent
     /// in the next message.
-    pub async fn as_sendable_conversation_state(&mut self) -> FigConversationState {
+    pub async fn as_sendable_conversation_state(&mut self, updates: &mut impl Write) -> FigConversationState {
         debug_assert!(self.next_message.is_some());
         self.fix_history();
 
         // The current state we want to send
         let mut curr_state = self.clone();
 
-        if let Some((user, assistant)) = self.context_messages().await {
+        if let Some((user, assistant)) = self.context_messages(updates).await {
             self.context_message_length = Some(user.content.len());
             curr_state
                 .history
@@ -424,7 +425,7 @@ impl ConversationState {
 
     /// Returns a pair of user and assistant messages to include as context in the message history
     /// depending on [Self::context_manager].
-    pub async fn context_messages(&self) -> Option<(UserInputMessage, AssistantResponseMessage)> {
+    pub async fn context_messages(&self, updates: &mut impl Write) -> Option<(UserInputMessage, AssistantResponseMessage)> {
         let Some(context_manager) = &self.context_manager else {
             return None;
         };
@@ -446,7 +447,7 @@ impl ConversationState {
         };
 
         // Context from hooks (scripts, commands, tools)
-        if let Some(hook_context) = self.get_hook_context(true).await {
+        if let Some(hook_context) = self.get_hook_context(true, updates).await {
             context_content.push_str(&hook_context);
         }
 
@@ -471,7 +472,7 @@ impl ConversationState {
         }
     }
 
-    pub async fn get_hook_context(&self, conversation_start: bool) -> Option<String> {
+    pub async fn get_hook_context(&self, conversation_start: bool, updates: &mut impl Write) -> Option<String> {
         let Some(context_manager) = &self.context_manager else {
             return None;
         };
@@ -479,9 +480,9 @@ impl ConversationState {
         let mut context_content = String::new();
 
         let hook_results = if conversation_start {
-            context_manager.run_conversation_start_hooks().await
+            context_manager.run_conversation_start_hooks(updates).await
         } else {
-            context_manager.run_per_prompt_hooks().await
+            context_manager.run_per_prompt_hooks(updates).await
         };
         let mut had_results = false;
         for (name, result, duration) in hook_results {
@@ -655,30 +656,32 @@ mod tests {
 
     #[tokio::test]
     async fn test_conversation_state_history_handling_truncation() {
+        let mut stdout = std::io::stdout();
         let mut conversation_state = ConversationState::new(Context::new_fake(), load_tools().unwrap(), None).await;
 
         // First, build a large conversation history. We need to ensure that the order is always
         // User -> Assistant -> User -> Assistant ...and so on.
-        conversation_state.append_new_user_message("start".to_string()).await;
+        conversation_state.append_new_user_message("start".to_string(),&mut stdout).await;
         for i in 0..=(MAX_CONVERSATION_STATE_HISTORY_LEN + 100) {
-            let s = conversation_state.as_sendable_conversation_state().await;
+            let s = conversation_state.as_sendable_conversation_state(&mut stdout).await;
             assert_conversation_state_invariants(s, i);
             conversation_state.push_assistant_message(AssistantResponseMessage {
                 message_id: None,
                 content: i.to_string(),
                 tool_uses: None,
             });
-            conversation_state.append_new_user_message(i.to_string()).await;
+            conversation_state.append_new_user_message(i.to_string(), &mut stdout).await;
         }
     }
 
     #[tokio::test]
     async fn test_conversation_state_history_handling_with_tool_results() {
+        let mut stdout = std::io::stdout();
         // Build a long conversation history of tool use results.
         let mut conversation_state = ConversationState::new(Context::new_fake(), load_tools().unwrap(), None).await;
-        conversation_state.append_new_user_message("start".to_string()).await;
+        conversation_state.append_new_user_message("start".to_string(), &mut stdout).await;
         for i in 0..=(MAX_CONVERSATION_STATE_HISTORY_LEN + 100) {
-            let s = conversation_state.as_sendable_conversation_state().await;
+            let s = conversation_state.as_sendable_conversation_state(&mut stdout).await;
             assert_conversation_state_invariants(s, i);
             conversation_state.push_assistant_message(AssistantResponseMessage {
                 message_id: None,
@@ -698,9 +701,9 @@ mod tests {
 
         // Build a long conversation history of user messages mixed in with tool results.
         let mut conversation_state = ConversationState::new(Context::new_fake(), load_tools().unwrap(), None).await;
-        conversation_state.append_new_user_message("start".to_string()).await;
+        conversation_state.append_new_user_message("start".to_string(), &mut stdout).await;
         for i in 0..=(MAX_CONVERSATION_STATE_HISTORY_LEN + 100) {
-            let s = conversation_state.as_sendable_conversation_state().await;
+            let s = conversation_state.as_sendable_conversation_state(&mut stdout).await;
             assert_conversation_state_invariants(s, i);
             if i % 3 == 0 {
                 conversation_state.push_assistant_message(AssistantResponseMessage {
@@ -723,13 +726,14 @@ mod tests {
                     content: i.to_string(),
                     tool_uses: None,
                 });
-                conversation_state.append_new_user_message(i.to_string()).await;
+                conversation_state.append_new_user_message(i.to_string(), &mut stdout).await;
             }
         }
     }
 
     #[tokio::test]
     async fn test_conversation_state_with_context_files() {
+        let mut stdout = std::io::stdout();
         let ctx = Context::builder().with_test_home().await.unwrap().build_fake();
         ctx.fs().write(AMAZONQ_FILENAME, "test context").await.unwrap();
 
@@ -737,9 +741,9 @@ mod tests {
 
         // First, build a large conversation history. We need to ensure that the order is always
         // User -> Assistant -> User -> Assistant ...and so on.
-        conversation_state.append_new_user_message("start".to_string()).await;
+        conversation_state.append_new_user_message("start".to_string(), &mut stdout).await;
         for i in 0..=(MAX_CONVERSATION_STATE_HISTORY_LEN + 100) {
-            let s = conversation_state.as_sendable_conversation_state().await;
+            let s = conversation_state.as_sendable_conversation_state(&mut stdout).await;
 
             // Ensure that the first two messages are the fake context messages.
             let hist = s.history.as_ref().unwrap();
@@ -763,7 +767,7 @@ mod tests {
                 content: i.to_string(),
                 tool_uses: None,
             });
-            conversation_state.append_new_user_message(i.to_string()).await;
+            conversation_state.append_new_user_message(i.to_string(), &mut stdout).await;
         }
     }
 }

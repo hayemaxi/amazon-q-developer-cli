@@ -556,7 +556,7 @@ where
                                     tool_uses,
                                     "The user interrupted the tool execution.".to_string(),
                                 );
-                                let _ = self.conversation_state.as_sendable_conversation_state().await;
+                                let _ = self.conversation_state.as_sendable_conversation_state(&mut self.output).await;
                                 self.conversation_state
                                     .push_assistant_message(AssistantResponseMessage {
                                         message_id: None,
@@ -724,14 +724,14 @@ where
                 if pending_tool_index.is_some() {
                     self.conversation_state.abandon_tool_use(tool_uses, user_input);
                 } else {
-                    self.conversation_state.append_new_user_message(user_input).await;
+                    self.conversation_state.append_new_user_message(user_input, &mut self.output).await;
                 }
 
                 self.send_tool_use_telemetry().await;
 
                 ChatState::HandleResponseStream(
                     self.client
-                        .send_message(self.conversation_state.as_sendable_conversation_state().await)
+                        .send_message(self.conversation_state.as_sendable_conversation_state(&mut self.output).await)
                         .await?,
                 )
             },
@@ -917,7 +917,7 @@ where
                             // Display global context
                             execute!(self.output, style::Print("global:\n"))?;
 
-                            if context_manager.global_config.paths.as_ref().is_none_or(|p| p.is_empty()) {
+                            if context_manager.global_config.paths.is_empty() {
                                 execute!(
                                     self.output,
                                     style::SetForegroundColor(Color::DarkGrey),
@@ -925,7 +925,7 @@ where
                                     style::SetForegroundColor(Color::Reset)
                                 )?;
                             } else {
-                                for path in context_manager.global_config.paths.as_ref().unwrap() {
+                                for path in &context_manager.global_config.paths {
                                     execute!(self.output, style::Print(format!("    {}\n", path)))?;
                                 }
                             }
@@ -933,7 +933,7 @@ where
                             // Display profile context
                             execute!(self.output, style::Print("\nprofile:\n"))?;
 
-                            if context_manager.profile_config.paths.as_ref().is_none_or(|p| p.is_empty()) {
+                            if context_manager.profile_config.paths.is_empty() {
                                 execute!(
                                     self.output,
                                     style::SetForegroundColor(Color::DarkGrey),
@@ -941,7 +941,7 @@ where
                                     style::SetForegroundColor(Color::Reset)
                                 )?;
                             } else {
-                                for path in context_manager.profile_config.paths.as_ref().unwrap() {
+                                for path in &context_manager.profile_config.paths {
                                     execute!(self.output, style::Print(format!("    {}\n", path)))?;
                                 }
                                 execute!(self.output, style::Print("\n"))?;
@@ -1072,6 +1072,63 @@ where
                                 style::Print(command::ContextSubcommand::help_text()),
                                 style::Print("\n")
                             )?;
+                        },
+                        command::ContextSubcommand::Hooks { subcommand } => {
+                            if let Some(subcommand) = subcommand {
+                                match subcommand {
+                                    command::HooksSubcommand::Add {  } => {
+                                        context_manager.add_hook();
+                                        execute!(
+                                            self.output,
+                                            style::SetForegroundColor(Color::Green),
+                                            style::Print(format!("\nAdded hook '{hook_name}' with command '{command}'\n\n")),
+                                            style::SetForegroundColor(Color::Reset)
+                                        )?;
+                                    },
+                                    command::HooksSubcommand::Remove { name } => {
+                                        context_manager.remove_hook(name);
+                                        execute!(
+                                            self.output,
+                                            style::SetForegroundColor(Color::Green),
+                                            style::Print(format!("\nRemoved hook '{name}'\n\n")),
+                                            style::SetForegroundColor(Color::Reset)
+                                        )?;
+                                    },
+                                    command::HooksSubcommand::Enable { name, global } => {
+                                        context_manager.enable_hook(name, global);
+                                        execute!(
+                                            self.output,
+                                            style::SetForegroundColor(Color::Green),
+                                            style::Print(format!("\nRemoved hook '{name}'\n\n")),
+                                            style::SetForegroundColor(Color::Reset)
+                                        )?;
+                                    },
+                                    command::HooksSubcommand::Disable { name, global } => {
+                                        context_manager.disable_hook(name, global);
+                                        execute!(
+                                            self.output,
+                                            style::SetForegroundColor(Color::Green),
+                                            style::Print(format!("\nRemoved hook '{name}'\n\n")),
+                                            style::SetForegroundColor(Color::Reset)
+                                        )?;
+                                    },
+                                    command::HooksSubcommand::Help => {
+                                        execute!(
+                                            self.output,
+                                            style::Print("\n"),
+                                            style::Print(command::HooksSubcommand::help_text()),
+                                            style::Print("\n")
+                                        )?;
+                                    },
+                                }
+                            } else {
+                                execute!(
+                                    self.output,
+                                    style::Print("\n"),
+                                    style::Print(format!("print help and current hooks")),
+                                    style::Print("\n")
+                                )?;
+                            }
                         },
                     }
                     // fig_telemetry::send_context_command_executed
@@ -1327,7 +1384,7 @@ where
         self.send_tool_use_telemetry().await;
         return Ok(ChatState::HandleResponseStream(
             self.client
-                .send_message(self.conversation_state.as_sendable_conversation_state().await)
+                .send_message(self.conversation_state.as_sendable_conversation_state(&mut self.output).await)
                 .await?,
         ));
     }
@@ -1404,12 +1461,13 @@ where
                                 .append_new_user_message(
                                     "You took too long to respond - try to split up the work into smaller steps."
                                         .to_string(),
+                                        &mut self.output,
                                 )
                                 .await;
                             self.send_tool_use_telemetry().await;
                             return Ok(ChatState::HandleResponseStream(
                                 self.client
-                                    .send_message(self.conversation_state.as_sendable_conversation_state().await)
+                                    .send_message(self.conversation_state.as_sendable_conversation_state(&mut self.output).await)
                                     .await?,
                             ));
                         },
@@ -1442,7 +1500,7 @@ where
                             self.send_tool_use_telemetry().await;
                             return Ok(ChatState::HandleResponseStream(
                                 self.client
-                                    .send_message(self.conversation_state.as_sendable_conversation_state().await)
+                                    .send_message(self.conversation_state.as_sendable_conversation_state(&mut self.output).await)
                                     .await?,
                             ));
                         },
@@ -1628,7 +1686,7 @@ where
 
             let response = self
                 .client
-                .send_message(self.conversation_state.as_sendable_conversation_state().await)
+                .send_message(self.conversation_state.as_sendable_conversation_state(&mut self.output).await)
                 .await?;
             return Ok(ChatState::HandleResponseStream(response));
         }
