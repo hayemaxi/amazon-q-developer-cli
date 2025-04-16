@@ -874,3 +874,4 @@ Without this feature:
 
 7. **Command Argument and Paths**: We can extend the CLI to accept arguments and filepaths. That way, we can match on any versions of "rm -rf" (e.g. "r, -fr") without the user having to specify specific rules. We can restrict commands to certain directories as well.
 
+7. **Rule Test Command**: A new command for users to test their permissions: `/tools test-rule <tool> <command/path>`.
