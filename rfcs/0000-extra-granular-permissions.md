@@ -6,28 +6,28 @@
 [summary]: #summary
 
 This RFC proposes extending the existing granular tool permissions system (proposed in https://github.com/aws/amazon-q-developer-cli/pull/921) to provide fine-grained control over tool execution. It introduces:
-1. path-based glob permissions for filesystem operations,
-2. command and argument-level permissions for the `execute_bash` tool,
-3. service/operation permissions for the `use_aws` tool, and
-4. an interactive way for users to add new permissions.
 
-Tool calls that do not pass the permissions check will require an acceptance prompt from the user.
+1. Path-based glob permissions for filesystem operations
+2. Command matching for the `execute_bash` tool
+3. Service/operation permissions for the `use_aws` tool
+4. Interactive permission rule creation
+
+Tool calls that don't match permission rules will require user confirmation.
 
 # Motivation
 
 [motivation]: #motivation
 
-With the current system, users must either trust a tool completely or approve each individual use. This creates friction in common workflows where users might want to:
+The current system forces users to either trust a tool completely or approve each use. This creates friction in common workflows where users want to:
 
-1. Trust filesystem operations only within specific project directories
-2. Trust certain shell commands but not others (e.g., allow `git status` but require confirmation for `git push`)
-3. Trust specific command patterns with certain arguments (e.g., `aws s3 ls` but not other AWS commands)
+- Trust filesystem operations only within specific project directories
+- Trust certain shell commands but not others (e.g., allow `git status` but require confirmation for `git push`)
+- Trust specific AWS operations (e.g., `aws s3 ls` but not other AWS commands)
 
-In user testing and feedback, we've observed that:
-
-- Users frequently approve the same operations repeatedly, leading to "prompt fatigue"
-- Some users resort to trusting entire tools when they only need a subset of functionality
-- Users working on multiple projects want different permission levels for different directories
+User testing shows:
+- "Prompt fatigue" from repeatedly approving the same operations
+- Users trusting entire tools when they only need a subset of functionality
+- Users wanting different permission levels for different projects
 
 # Guide-level explanation
 
@@ -48,20 +48,18 @@ options:
 --service <service> --operation <operation>  # for use_aws: allow or block an aws service
 ```
 
-These commands provide a clear and consistent way to manage permissions by adding the concept of "rules", i.e. allow rules and block rules:
-- `allow` grants permission for a specific path, command, or AWS service operation
-    - The specific path/command/operation (or pattern) must match an allowed rule.
-    - If there are no allowed patterns, then nothing will pass and everything will requie confirmation.
-- `block` explicitly blocks a specific path, command, or AWS operation (overrides allow rules).
-    - This is not required to ensure that Amazon Q prompts for a tool. Rather, it allows the user to configure situations such as "allow all git commands ... except git push"
-- `remove-rule` removes a rule from either the allow or block list, resetting to default behavior for that path/command/operation
+These commands manage "rules" that control tool permissions:
+- `allow` grants permission for specific paths, commands, or AWS operations
+- `block` explicitly blocks specific paths, commands, or operations (overrides allow rules)
+- `remove-rule` removes a rule from the allow and block lists
+
+The existing `/tools trust` and `/tools untrust` commands remain as shortcuts for allowing or blocking everything.
 
 Aligned with existing functionality, tools can be completely trusted using `/tools trust`, which would be the equivalent of allowing all paths/commands. Tools can also be completely untrusted using `/tools untrust`, which would be the equivalent of blocking all paths/commands.
 
 Note: Not all options apply to each tool. To make it clear to the user what sort of permissions they are granting, explicit and tool-specific options are necessary.
 
-
-## Path-Based Permissions
+### Path-Based Permissions
 
 Users can specify allowed and blocked paths for filesystem operations:
 
@@ -81,10 +79,9 @@ This allows Amazon Q to:
 - Write to `/path/to/output` and all its subdirectories without confirmation
 - Prompt to write to `/path/to/project/config` or its subdirectories (despite the broader allow rule existing)
 
-Path patterns support standard glob style syntax. Paths are stored and displayed as provided by the user, but are normalized to absolute paths when comparing against what is requested by the fs_read and fs_write tools.
+Path patterns support standard glob syntax and are normalized to absolute paths when comparing.
 
-
-## Command-Based Permissions
+### Command-Based Permissions
 
 For the `execute_bash` tool, users can allow or block specific commands:
 
@@ -105,7 +102,7 @@ Command patterns will match by prefix (`.startswith`). For example `git` and `gi
 Piped commands will be treated as separate commands. All commands sent to a single `execute_bash` call must pass the allow to avoid confirmation.
 
 
-## AWS CLI Permissions
+### AWS CLI Permissions
 
 For the `use_aws` tool, users can allow or block specific service/operation combinations:
 
@@ -125,7 +122,7 @@ This allows Amazon Q to:
 - Run any `describe` operations on any service without confirmation
 - Prompt to run any IAM operations
 
-This pattern match will be similar to glob style matching, allowing the use of "*" to as a wildcard for matching on services or operations. This is particularly useful for AWS operations, allowing users to:
+This pattern match will be similar to glob style matching, allowing the use of "*" to as a wildcard for matching on services or operations. This is useful for AWS operations, allowing:
 - Allow all read-only operations (`get*`, `describe*`, `list*`)
 - Allow operations on specific services, or all services with "*"
 - Block sensitive services or operations
@@ -137,10 +134,11 @@ This pattern match will be similar to glob style matching, allowing the use of "
 
 Other tools that do not require further granularity such as `report_issue` continue to work with `/tools trust` and `/tools untrust`, and does not accept any other granular permission commands, e.g.
 ```
-/tools allow report_isuse --path /some/path/*
+/tools allow report_issue --path /some/path/*
 
 Error: 'report_issue' does not use path permissions. Use `/tools [trust/untrust] report_issue` to enabled/disable acceptance prompting.
 ```
+
 
 ### Custom tools from MCP
 
@@ -222,7 +220,7 @@ Current tools and permissions from MCP:
 
 ## Rule Removal
 
-Users can run the existing `/tools reset <optional tool name>` command to reset tools to their default permission levels. Alternatively, the `remove-rule` command to remove to remove patterns from the rules. Removing a rule will remove it from both allowed and block lists. `/tools untrust` and `/tools trust` will also remove any permissions set such that everything is eithered allowed or blocked.
+Users can run the existing `/tools reset <optional tool name>` command to reset tools to their default permission levels. Alternatively, the `remove-rule` command to remove to remove patterns from the rules. Removing a rule will remove it from both allowed and block lists. `/tools untrust` and `/tools trust` will also remove any permissions set such that everything is either allowed or blocked.
 
 ```
 > /tools fs-write
@@ -248,9 +246,10 @@ Current permissions for `fs_write`:
     * (all)
 ```
 
+
 ## Interactive Rule Creation
 
-When prompted for tool approval, users can now create rules directly:
+When prompted for tool approval, users can create rules directly:
 
 ```
 Amazon Q: I'll check the status of your git repository.
@@ -317,22 +316,18 @@ Executing command...
 3. Check for matching allow patterns - if found, allow without prompting
 4. If no patterns match, require confirmation
 
-## Backward Compatibility
 
-All existing tool permission commands continue to work as before, for example, this still works to trust all `execute_bash` operations:
+## Storage
 
-```
-/tools trust execute_bash
-```
+Permission rules will be stored in memory for the current session only, consistent with the existing tool permissions system.
 
-And we can remove all permissions so that all calls to `execute_bash` require confirmation:
-```
-/tools untrust execute_bash # Still works - requires confirmation for all execute_bash operations
-```
 
 # Reference-level explanation
 
 [reference-level-explanation]: #reference-level-explanation
+
+<details>
+<summary>Data Structure updates pseudo-code implementation</summary>
 
 ## Data Structures
 
@@ -782,9 +777,8 @@ fn prompt_for_rule_creation(&mut self, tool_name: &str, params: &Value) -> Resul
 }
 ```
 
-## Storage
+</details>
 
-Permission rules will be stored in memory for the current session only, consistent with the existing tool permissions system.
 
 # Drawbacks
 
@@ -792,17 +786,16 @@ Permission rules will be stored in memory for the current session only, consiste
 
 1. **Increased Complexity**: Adding pattern-based permissions significantly increases the complexity of the permission system, both in terms of implementation and user understanding.
 
-2. **Learning Curve**: Users will need to learn pattern syntax and understand how different patterns apply to different tools. Even though glob pattern is familiar to many developers, it may be confusing to less technical users.
+2. **UI Complexity**: We are adding more complicated configuration commands, which may make the tool less approachable for new users.
 
-3. **UI Complexity**: We are adding more complicated configuration commands, which may make the tool less approachable for new users.
+3. **Performance Impact**: Pattern matching, especially for complex patterns and large numbers of rules, could introduce performance overhead when checking permissions. Each tool use would require evaluating multiple patterns.
 
-4. **Performance Impact**: Pattern matching, especially for complex patterns and large numbers of rules, could introduce performance overhead when checking permissions. Each tool use would require evaluating multiple patterns.
+4. **Security Risks**: More granular permissions could lead to unintended security holes if users create overly broad patterns without fully understanding their implications.
 
-5. **Security Risks**: More granular permissions could lead to unintended security holes if users create overly broad patterns without fully understanding their implications.
+5. **Maintenance Burden**: Additional built-in tools may have to implement custom permissions handling.
 
-6. **Maintenance Burden**: Additional built-in tools may have to implement custom permissions handling.
+6. **Missing Further Granularity**: Users cannot easily specify specific arguments or filepaths.
 
-7. **Missing Further Granularity** Users cannot easily specify specific arguments or filepaths.
 
 # Rationale and alternatives
 
@@ -820,9 +813,6 @@ This design was chosen because it:
 
 4. **Provides flexibility**: The pattern-based approach can be extended to new tools and use cases without changing the core permission model. This ensures the system can evolve as new tools are added. Command based matching can be extended to check for particular arguments or filespaths in any order.
 
-5. **Follows principle of least privilege**: Users can grant the minimum permissions necessary for their workflow, rather than trusting entire tools.
-
-6. **Supports interactive creation**: The interactive rule creation flow makes it easy for users to discover the permissions tool and create appropriate rules without needing to understand the full syntax.
 
 ## Alternatives considered
 
@@ -830,46 +820,19 @@ This design was chosen because it:
 
 We could define common permission presets (e.g., "development mode", "read-only mode") that users could switch between.
 
-**Pros**:
-- Simple for users to understand and use
-- Provides a curated set of permissions for common workflows
-- Reduces the need for users to create their own rules
-
-**Cons**:
-- Users would still need a way to customize permissions for their specific needs
-- It would be difficult to define presets that work well across different environments
-
-This was rejected because it wouldn't provide the fine-grained control that users need for their specific workflows.
+While simpler for users, this was rejected because it wouldn't provide the fine-grained control that users need for their specific workflows. It would be difficult to generalize useful presets.
 
 ### 2. Directory Allowlists
 
 Instead of pattern matching, we could implement a simpler directory allowlist system where users specify directories that are trusted for specific operations.
 
-**Pros**:
-- Simpler to understand and implement
-- Less potential for security issues from complex patterns
-- More explicit about which directories are trusted
-
-**Cons**:
-- Less flexible than pattern matching
-- Doesn't address command-level permissions for `execute_bash` and `use_aws`
-
-This was rejected because it lacks the flexibility needed to address the full range of use cases, particularly for command-based tools.
+While simpler to interact with, this was rejected because it lacks the flexibility needed to address the full range of use cases, particularly for command-based tools.
 
 ### 3. Regular Expression Patterns
 
-We could use regular expressions for more powerful matching:
+We could use regular expressions for more powerful matching instead of relying on globs or prefix matching.
 
-**Pros**:
-- More expressive pattern matching for commands
-- Standard pattern syntax
-
-**Cons**:
-- More complex for users to understand and use
-- Security implications of complex regex patterns
-- Likely edge cases that may perform dangerous commands.
-
-This was rejected because we can't expect users to understand regex to operate permissions.
+This was rejected because we can't expect users to understand regex to operate permissions. Also, glob is powerful for paths, and prefix matching gets us most of the way there.
 
 
 ## Impact of not doing this
@@ -884,7 +847,7 @@ Without this feature:
 
 [unresolved-questions]: #unresolved-questions
 
-1. **Pattern Syntax Details**: What specific pattern syntax should we use? Should we adopt an existing library like `globset` or implement our own pattern matching? How should we handle edge cases like case sensitivity and special characters? How will pattern matching hold up with paths on different operating systems?
+1. **Pattern Syntax Details**: What specific pattern syntax should we use? How will pattern matching hold up with paths on different operating systems?
 
 2. **Rule Management Interface**: What's the most user-friendly way to allow users to manage (list, edit, delete) existing rules?
 
@@ -892,30 +855,22 @@ Without this feature:
 
 4. **Tool-Specific Parameter Handling**: Should different tools have different parameter types for pattern matching (e.g., `--path` for filesystem tools, `--command` for execute_bash)? How do we maintain consistency while addressing tool-specific needs?
 
-5. **AWS Service Operation Granularity**: For AWS operations, what's the right level of granularity? Should we allow patterns on service names, operation names, resource ARNs, or combinations of these?
-
-6. **Testing Strategy**: What's the best approach to comprehensively test the pattern matching system across different tools and pattern types?
-
 
 # Future possibilities
 
 [future-possibilities]: #future-possibilities
 
-1. **Permission Presets**: Allow users to define and switch between permission presets for different workflows. These can be shared amongst users.
+1. **Time-Limited Permissions**: Allow permissions to expire after a certain time or number of uses.
 
-2. **Time-Limited Permissions**: Allow permissions to expire after a certain time or number of uses.
+2. **Permission Auditing**: Provide a log of permission grants and tool uses for review.
 
-3. **Permission Auditing**: Provide a log of permission grants and tool uses for review.
+3. **Integration with Profiles/Persistent Storage**: Allow saving trusted paths/commands as part of user profiles.
 
-4. **Integration with Profiles/Persistant Storage**: Allow saving trusted paths/commands as part of user profiles.
+4. **Command Suggestions**: Suggest common commands to trust based on usage patterns.
 
-5. **Command Suggestions**: Suggest common commands to trust based on usage patterns.
+5. **Risk Assessment**: Provide risk assessments for commands before trusting them.
 
-6. **Risk Assessment**: Provide risk assessments for commands before trusting them.
+6. **AWS Resource Handling**: A more complicated rule system for `use_aws` that can granularize up to the AWS resource to operate on.
 
-7. **Command Handling**: A more complicated rule system for bash commands that can detect additional parameters like paths.
-
-8. **AWS Resource Handling**: A more complicated rule system for `use_aws` that can granularize up to the AWS resource to operate on.
-
-9. **Command Argument and Paths**: We can extend the CLI to accept arguments and filepaths. That way, we can match on any versions of "rm -rf" (e.g. "r, -fr") without the user having to specifiy specific rules. We can restrict commands to certain directories as well.
+7. **Command Argument and Paths**: We can extend the CLI to accept arguments and filepaths. That way, we can match on any versions of "rm -rf" (e.g. "r, -fr") without the user having to specify specific rules. We can restrict commands to certain directories as well.
 
