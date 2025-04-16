@@ -250,7 +250,7 @@ Current permissions for `fs_write`:
     * (all)
 ```
 
-### Interactive Rule Creation
+## Interactive Rule Creation
 
 When prompted for tool approval, users can now create rules directly:
 
@@ -278,6 +278,17 @@ Rule added: execute_bash --command="git status *"
 Executing command...
 ```
 
+For fs_write, this might look like:
+```
+Create rule for: fs_write (write=/users/me/my/project/test.txt)
+Trusted paths do not ask for confirmation before writing.
+
+1. Trust this exact path only
+2. Trust the current directory (/users/me/)
+3. Trust all requests from this tool 'fs_write'
+Or, 'y' to run without adding a rule:
+```
+
 For MCP tools, the prompt would be what is currently available.
 ```
 [Tool Request: parse_markdown]
@@ -289,21 +300,27 @@ Allow this action? Use 't' to trust (always allow) this tool for the session. [y
 Executing command...
 ```
 
-### Rule evaluation
+## Rule evaluation
 
 1. Trusted tools are always allowed without prompting.
 2. Allowing or blocking a pattern disables trusted status for the tool.
 2. Blocked patterns override trusted patterns if both are matched.
 3. If a tool is not trusted, a pattern will automatically be blocked if there is no match in allowed patterns.
 
-### Backward Compatibility
+## Backward Compatibility
 
-All existing tool permission commands continue to work as before. The new functionality is additive and builds upon the existing system:
+All existing tool permission commands continue to work as before, for example, this still works to trust all `execute_bash` operations:
 
 ```
-/tools trust fs_read          # Still works - trusts all fs_read operations
-/acceptall                    # Still works - trusts all tools
-/tools untrust execute_bash   # Still works - requires confirmation for all execute_bash operations
+/tools trust execute_bash
+# Equivalent to /tools allow execute_bash --command *
+# (and removing anything in the block list)
+```
+
+And we can remove all permissions so that all calls to `execute_bash` require confirmation:
+```
+/tools untrust execute_bash # Still works - requires confirmation for all execute_bash operations
+# Equivalent to /tools block execute_bash --command *
 ```
 
 # Reference-level explanation
@@ -315,164 +332,147 @@ All existing tool permission commands continue to work as before. The new functi
 We'll extend the existing `ToolPermission` structure to support pattern-based rules:
 
 ```rust
-/// Represents a pattern-based permission rule
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PermissionRule {
-    /// The pattern to match against (path, command, etc.)
-    pattern: String,
-    /// Whether this rule grants permission when matched
-    is_allowed: bool,
-}
-
-/// Enhanced tool permission structure
-#[derive(Debug, Clone)]
 pub struct ToolPermission {
-    /// Whether the entire tool is trusted (from RFC-0002)
     trusted: bool,
-    /// Path-based rules for filesystem tools
-    path_rules: Vec<PermissionRule>,
-    /// Command-based rules for execute_bash
-    command_rules: Vec<PermissionRule>,
-    /// Service/operation rules for use_aws
-    aws_rules: Vec<PermissionRule>,
+    allowed_patterns: HashSet<String>,
+    blocked_patterns: HashSet<String>,
 }
 
-#[derive(Debug, Clone)]
 pub struct ToolPermissions {
     permissions: HashMap<String, ToolPermission>,
 }
 
-/// Enum representing different rule types
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RuleType {
-    Path,
-    Command,
-    AwsOperation,
+pub enum ToolParams {
+    Path(String),
+    Command(String),
+    Empty,
 }
 
-/// Struct for rule creation suggestions
-#[derive(Debug, Clone)]
-pub struct RuleSuggestion {
-    rule_type: RuleType,
-    pattern: String,
-    description: String,
+impl ToolPermissions {
+    // ... existing implementation
+
+    fn pattern_matches(&self, pattern: &str, value: &str) -> bool {
+        // Implementation using the globset crate for efficient pattern matching
+        let glob = globset::Glob::new(pattern)
+            .map(|g| g.compile_matcher())
+            .unwrap_or_else(|_| globset::GlobMatcher::new());
+        
+        glob.is_match(value)
+    }
+
+    fn requires_acceptance(&self, tool_name: &str, params: &ToolParams) -> bool {
+        let permission = match self.permissions.get(tool_name) {
+            Some(p) => p,
+            None => return true, // No permission entry means we need acceptance
+        };
+        
+        // If the entire tool is trusted, no acceptance needed
+        if permission.trusted {
+            return false;
+        }
+
+        match params {
+            Path(path_param) => {
+                for pattern in permission.blocked_patterns {
+                    if self.pattern_matches(pattern, path_param.path) {
+                        // Match any blocked pattern to require acceptance
+                        return true
+                    }
+                }
+                for pattern in permission.allow_patterns {
+                    if self.pattern_matches(pattern, path_param.path) {
+                        // Must match any allow to skip acceptance
+                        return false
+                    }
+                }
+
+                // Didn't match any allow patterns, need acceptance
+                return true
+            },
+            Command(command_param) => {
+                // Gather piped commands
+                let commands: Vec<String> = t.command
+                    .split('|')
+                    .map(|cmd| cmd.trim().to_string())
+                    .collect();
+
+                for cmd in in commands {
+                    for pattern in permission.blocked_patterns {
+                        if self.pattern_matches(pattern, path_param.path) {
+                            return true
+                        }
+                    }
+                    for pattern in permission.allow_patterns {
+                        if self.pattern_matches(pattern, path_param.path) {
+                            // Confirmed this command is fine, lets try next
+                            continue
+                        }
+                    }
+                    // This command wasn't matched by allow_patterns, return
+                    return true
+                }
+                // Checked all commands without failing, we're good
+                return false
+            },
+            Empty => return true // Nothing to check and the tool isn't trusted - require acceptance
+        }
+    }
+
+    fn add_rule_pattern(tool_name: &str, pattern: String, allow: bool) {
+        let permission = self.permissions.get_or_add(tool_name);
+        if allow {
+            permission.allowed_patterns.insert(pattern)
+        } else {
+            permission.blocked_pattherns.insert(pattern)
+        }
+        Ok(())
+    }
+
+    fn remove_rule_pattern(tool_name: &str, pattern: String) {
+        let Some(permission) = self.permissions.get(tool_name) else {
+            return Err("Tool does not have permissions.")
+        }
+        // Remove from both at a time to simplify UX
+        permission.allowed_patterns.remove(pattern)
+        permission.blocked_pattherns.remove(pattern)
+
+        Ok(())
+    }
 }
 ```
 
-## Pattern Matching System
-
-The pattern matching system uses glob-style patterns with a clear hierarchy of specificity:
+## Call For Tool Acceptance
 
 ```rust
-/// Calculates the specificity of a pattern (higher is more specific)
-fn calculate_specificity(pattern: &str) -> u32 {
-    let mut specificity = 0;
-    
-    // Exact characters increase specificity
-    specificity += pattern.chars().filter(|c| *c != '*' && *c != '?').count() as u32 * 10;
-    
-    // Single wildcards (?) are more specific than multi-wildcards (*)
-    specificity += pattern.chars().filter(|c| *c == '?').count() as u32 * 5;
-    
-    // Double wildcards (**) reduce specificity significantly
-    specificity -= pattern.matches("**").count() as u32 * 50;
-    
-    specificity
-}
-```
-
-For path patterns:
-- `*` matches any sequence of characters within a path component
-- `**` matches zero or more path components
-- `?` matches any single character
-
-For command patterns:
-- Command patterns are split into the command name and arguments
-- `command **` would match any invocation of that command regardless of arguments
-- `command arg1 *` would match the command with arg1 and any single additional argument
-
-## Permission Checking Logic
-
-The permission checking flow will be enhanced to handle the new rule types:
-
-```rust
-fn is_tool_allowed(&self, tool_name: &str, params: &Value) -> bool {
-    let permission = match self.permissions.get(tool_name) {
-        Some(p) => p,
-        None => return false, // No permission entry means not trusted
-    };
-    
-    // If the entire tool is trusted, allow it
-    if permission.trusted {
-        return true;
-    }
-    
-    // Check specific rules based on tool type
-    match tool_name {
-        "fs_read" | "fs_write" => {
-            let path = params.get("path").and_then(|v| v.as_str()).unwrap_or("");
-            self.check_path_permission(permission, path)
-        },
-        "execute_bash" => {
-            let command = params.get("command").and_then(|v| v.as_str()).unwrap_or("");
-            self.check_command_permission(permission, command)
-        },
-        "use_aws" => {
-            let service = params.get("service_name").and_then(|v| v.as_str()).unwrap_or("");
-            let operation = params.get("operation_name").and_then(|v| v.as_str()).unwrap_or("");
-            self.check_aws_permission(permission, service, operation)
-        },
-        _ => false,
-    }
-}
-
-fn check_path_permission(&self, permission: &ToolPermission, path: &str) -> bool {
-    // First check for explicit blocks
-    for rule in &permission.path_rules {
-        if !rule.is_allowed && self.pattern_matches(&rule.pattern, path) {
-            return false; // Blocked by explicit rule
+async fn tool_use_execute(&mut self, mut tool_uses: Vec<QueuedTool>) -> Result<ChatState, ChatError> {
+    // Verify tools have permissions.
+    for (index, tool) in tool_uses.iter_mut().enumerate() {
+        // Manually accepted by the user or otherwise verified already.
+        if tool.accepted {
+            continue;
         }
-    }
-    
-    // Then check for allows, sorted by specificity
-    let mut allow_rules: Vec<&PermissionRule> = permission.path_rules
-        .iter()
-        .filter(|r| r.is_allowed)
-        .collect();
-    
-    // Sort by specificity (most specific first)
-    allow_rules.sort_by(|a, b| {
-        let a_spec = calculate_specificity(&a.pattern);
-        let b_spec = calculate_specificity(&b.pattern);
-        b_spec.cmp(&a_spec).then_with(|| b.created_at.cmp(&a.created_at))
-    });
-    
-    for rule in allow_rules {
-        if self.pattern_matches(&rule.pattern, path) {
-            return true;
+
+        // Prepare the permissions request from the tool
+        let params = match tool {
+            FsWrite(t), FsRead(t) => ToolParams::Path(t.path)
+            ExecuteBash(t) => ToolParams::Command(t.command)
+
+            // Treat this like a command - because it simplifies things and it basically is one
+            UseAws(t) => ToolParams::Command(format!("aws {} {} {}", t.service, t.operation, t.parameters))
+            _ => ToolParams::Empty
+        };
+        let requires_acceptance = if self.tool_permissions.requires_acceptance(&tool.name, params);
+
+        if !requires_acceptance {
+            tool.accepted = true;
+            continue;
         }
+
+        // ask for acceptance
     }
-    
-    false
-}
 
-fn check_command_permission(&self, permission: &ToolPermission, command: &str) -> bool {
-    // Similar implementation to check_path_permission but for commands
+    // Execute tools
     // ...
-}
-
-fn check_aws_permission(&self, permission: &ToolPermission, service: &str, operation: &str) -> bool {
-    // Check AWS service/operation permissions
-    // ...
-}
-
-fn pattern_matches(&self, pattern: &str, value: &str) -> bool {
-    // Implementation using the globset crate for efficient pattern matching
-    let glob = globset::Glob::new(pattern)
-        .map(|g| g.compile_matcher())
-        .unwrap_or_else(|_| globset::GlobMatcher::new());
-    
-    glob.is_match(value)
 }
 ```
 
@@ -481,17 +481,31 @@ fn pattern_matches(&self, pattern: &str, value: &str) -> bool {
 The `/tools` command will be extended to support the new rule-based syntax:
 
 ```rust
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolsSubcommand {
-    Trust { tool_name: String },
-    Untrust { tool_name: String },
-    TrustAll,
-    Reset,
-    Rules,
-    RulesAdd { tool_name: String, rule_type: RuleType, pattern: String },
-    RulesRemove { tool_name: String, rule_type: RuleType, pattern: String },
-    Block { tool_name: String, rule_type: RuleType, pattern: String },
-    Unblock { tool_name: String, rule_type: RuleType, pattern: String },
+    /// ...existing commands
+    
+    // New commands
+    Allow { 
+        tool_name: String, 
+        path: Option<String>,
+        command: Option<String>,
+        service: Option<String>,
+        operation: Option<String>,
+    },
+    Deny { 
+        tool_name: String, 
+        path: Option<String>,
+        command: Option<String>,
+        service: Option<String>,
+        operation: Option<String>,
+    },
+    RemoveRule { 
+        tool_name: String, 
+        path: Option<String>,
+        command: Option<String>,
+        service: Option<String>,
+        operation: Option<String>,
+    },
     Help,
 }
 
@@ -504,100 +518,22 @@ fn handle_tools_command(&mut self, args: &str) -> Result<()> {
     }
     
     let parts: Vec<&str> = args.split_whitespace().collect();
-    match parts[0] {
-        // Existing commands from RFC-0002
-        "trust" if parts.len() > 1 => {
-            // Check for new pattern-based syntax
-            if parts.len() > 2 && parts[2].starts_with("--") {
-                self.handle_pattern_trust(parts[1], &parts[2..])?;
-            } else {
-                self.tool_permissions.trust_tool(parts[1]);
-                self.output_tool_now_trusted(parts[1])?;
-            }
+    match parts[1] {
+        // ... existing commands
+
+        // implicit parsing
+        "allow" => {
+            self.tool_permissions.remove_rule_pattern(&parts[2..], true)?;
         },
-        "rules" if parts.len() == 1 => {
-            self.show_permission_rules()?;
+        "block" => {
+            self.tool_permissions.add_rule_pattern(&parts[2..], false)?;
         },
-        "rules" if parts.len() > 1 && parts[1] == "add" => {
-            self.handle_rules_add(&parts[2..])?;
-        },
-        "rules" if parts.len() > 1 && parts[1] == "remove" => {
-            self.handle_rules_remove(&parts[2..])?;
-        },
-        "block" if parts.len() > 1 => {
-            self.handle_block(parts[1], &parts[2..])?;
+        "remove-rule" => {
+            self.tool_permissions.remove_rule_pattern(&parts[2..])?;
         },
         // Other commands...
         _ => {
             self.output_tools_help()?;
-        }
-    }
-    
-    Ok(())
-}
-
-fn handle_pattern_trust(&mut self, tool_name: &str, args: &[&str]) -> Result<()> {
-    // Parse arguments like --path=/some/path or --command="git status"
-    let mut path = None;
-    let mut command = None;
-    let mut service = None;
-    let mut operation = None;
-    
-    let mut i = 0;
-    while i < args.len() {
-        match args[i] {
-            "--path" => {
-                if i + 1 < args.len() {
-                    path = Some(args[i + 1]);
-                    i += 2;
-                } else {
-                    return Err(eyre::eyre!("Missing value for --path"));
-                }
-            },
-            arg if arg.starts_with("--path=") => {
-                path = Some(&arg[7..]);
-                i += 1;
-            },
-            "--command" => {
-                if i + 1 < args.len() {
-                    command = Some(args[i + 1]);
-                    i += 2;
-                } else {
-                    return Err(eyre::eyre!("Missing value for --command"));
-                }
-            },
-            arg if arg.starts_with("--command=") => {
-                command = Some(&arg[10..]);
-                i += 1;
-            },
-            // Handle other arguments...
-            _ => {
-                i += 1;
-            }
-        }
-    }
-    
-    // Add the appropriate rule based on the tool and arguments
-    match tool_name {
-        "fs_read" | "fs_write" => {
-            if let Some(p) = path {
-                self.tool_permissions.add_path_rule(tool_name, p, true)?;
-                self.output_path_rule_added(tool_name, p)?;
-            } else {
-                return Err(eyre::eyre!("Missing --path for filesystem tool"));
-            }
-        },
-        "execute_bash" => {
-            if let Some(cmd) = command {
-                self.tool_permissions.add_command_rule(tool_name, cmd, true)?;
-                self.output_command_rule_added(tool_name, cmd)?;
-            } else {
-                return Err(eyre::eyre!("Missing --command for execute_bash"));
-            }
-        },
-        // Handle other tools...
-        _ => {
-            return Err(eyre::eyre!("Unsupported tool for pattern-based permissions"));
         }
     }
     
@@ -610,7 +546,85 @@ fn handle_pattern_trust(&mut self, tool_name: &str, args: &[&str]) -> Result<()>
 When a user chooses to create a rule during tool approval, we'll present appropriate options based on the tool type:
 
 ```rust
-fn handle_rule_creation(&mut self, tool_name: &str, params: &Value) -> Result<()> {
+fn prompt_for_tool_execution(&mut self, tool_name: &str, params: &Value) -> Result<ToolPromptResponse> {
+    execute!(
+        self.output,
+        style::SetForegroundColor(Color::Yellow),
+        style::Print(format!("[Tool Request: {} ({})]\n", tool_name, params)),
+        style::Print("Allow this action? Use 'c' to configure tool permission. [y/n/c]:"),
+        style::SetForegroundColor(Color::Reset)
+    )?;
+    
+    // Read user input and return appropriate response
+    if input == "c" {
+        prompt_for_rule_creation(tool_name, params);
+    } else {
+        // ...
+    }
+}
+
+fn handle_command_rule_creation(&mut self, tool_name: &str, params: &Value) -> Result<ToolPromptResponse> {
+    execute!(
+        self.output,
+        style::Print("1. Trust this exact command only\n"),
+        style::Print(format!("2. Trust all '{}' commands with any arguments\n", params.command)),
+        style::Print(format!("3. Trust all '{}' commands\n", base_command(params.command))),
+        style::Print(format!("4. Trust all requests from this tool '{}'\n", tool_name)),
+        style::Print("Or, 'y' to run without adding a rule:"),
+    )?;
+
+    // Read user input and return appropriate response
+    match user_input {
+        "1" => {
+            self.tool_permissions.add_rule_pattern(tool_name, params.command);
+            ChatState::ToolUseExecute()
+        },
+        "2" => {
+            self.tool_permissions.add_rule_pattern(tool_name, format!("{}*", params.command));
+            ChatState::ToolUseExecute()
+        },
+        "3" => {
+            self.tool_permissions.add_rule_pattern(tool_name, base_command(params.command));
+            ChatState::ToolUseExecute()
+        },
+        "4" => {
+            self.tool_permissions.trust(tool_name);
+            ChatState::ToolUseExecute()
+        },
+        "y" -> ChatState::ToolUseExecute()
+        _ -> ChatState::HandleInput(user_input)
+    }
+}
+
+fn handle_filesystem_rule_creation(&mut self, tool_name: &str, params: &Value) -> Result<ToolPromptResponse> {
+    execute!(
+        self.output,
+        style::Print("1. Trust this exact path only\n"),
+        style::Print(format!("2. Trust all '{}' commands\n", base_command(params.command))),
+        style::Print(format!("3. Trust all requests from this tool '{}'\n", tool_name)),
+        style::Print("Or, 'y' to run without adding a rule:"),
+    )?;
+
+    // Read user input and return appropriate response
+    match user_input {
+        "1" => {
+            self.tool_permissions.add_rule_pattern(tool_name, params.path);
+            ChatState::ToolUseExecute()
+        },
+        "2" => {
+            self.tool_permissions.add_rule_pattern(tool_name, pwd());
+            ChatState::ToolUseExecute()
+        },
+        "3" => {
+            self.tool_permissions.trust(tool_name);
+            ChatState::ToolUseExecute()
+        },
+        "y" -> ChatState::ToolUseExecute()
+        _ -> ChatState::HandleInput(user_input)
+    }
+}
+
+fn prompt_for_rule_creation(&mut self, tool_name: &str, params: &Value) -> Result<()> {
     match tool_name {
         "fs_read" | "fs_write" => {
             self.handle_filesystem_rule_creation(tool_name, params)?;
@@ -619,95 +633,12 @@ fn handle_rule_creation(&mut self, tool_name: &str, params: &Value) -> Result<()
             self.handle_command_rule_creation(tool_name, params)?;
         },
         "use_aws" => {
-            self.handle_aws_rule_creation(tool_name, params)?;
+            self.handle_command_rule_creation(tool_name, params)?;
         },
-        _ => {
-            execute!(
-                self.output,
-                style::SetForegroundColor(Color::Yellow),
-                style::Print("Rule creation not supported for this tool type.\n"),
-                style::SetForegroundColor(Color::Reset)
-            )?;
-        }
+        _ => Err("Unsupported tool")
     }
     
     Ok(())
-}
-
-fn handle_command_rule_creation(&mut self, tool_name: &str, params: &Value) -> Result<()> {
-    let command = params.get("command").and_then(|v| v.as_str()).unwrap_or("");
-    
-    // Generate rule suggestions based on the command
-    let suggestions = self.generate_command_rule_suggestions(command);
-    
-    execute!(
-        self.output,
-        style::SetForegroundColor(Color::Cyan),
-        style::Print(format!("\nCreate rule for: {}\n", command)),
-        style::SetForegroundColor(Color::Reset)
-    )?;
-    
-    // Display numbered suggestions
-    for (i, suggestion) in suggestions.iter().enumerate() {
-        execute!(
-            self.output,
-            style::Print(format!("{}. {}\n", i + 1, suggestion.description))
-        )?;
-    }
-    
-    execute!(self.output, style::Print("> "))?;
-    let choice = self.read_line()?;
-    
-    // Parse choice and add the selected rule
-    if let Ok(index) = choice.trim().parse::<usize>() {
-        if index > 0 && index <= suggestions.len() {
-            let selected = &suggestions[index - 1];
-            self.tool_permissions.add_command_rule(tool_name, &selected.pattern, true)?;
-            
-            execute!(
-                self.output,
-                style::SetForegroundColor(Color::Green),
-                style::Print(format!("\nRule added: {} --command=\"{}\"\n", tool_name, selected.pattern)),
-                style::SetForegroundColor(Color::Reset)
-            )?;
-        }
-    }
-    
-    Ok(())
-}
-
-fn generate_command_rule_suggestions(&self, command: &str) -> Vec<RuleSuggestion> {
-    let mut suggestions = Vec::new();
-    
-    // Split command into parts
-    let parts: Vec<&str> = command.split_whitespace().collect();
-    
-    if !parts.is_empty() {
-        // Exact command
-        suggestions.push(RuleSuggestion {
-            rule_type: RuleType::Command,
-            pattern: command.to_string(),
-            description: format!("Trust this exact command only"),
-        });
-        
-        // Command with any arguments
-        suggestions.push(RuleSuggestion {
-            rule_type: RuleType::Command,
-            pattern: format!("{} **", parts[0]),
-            description: format!("Trust all '{}' commands with any arguments", parts[0]),
-        });
-        
-        // If there are subcommands (like git status, aws s3 ls)
-        if parts.len() > 1 {
-            suggestions.push(RuleSuggestion {
-                rule_type: RuleType::Command,
-                pattern: format!("{} {} **", parts[0], parts[1]),
-                description: format!("Trust all '{} {}' commands with any arguments", parts[0], parts[1]),
-            });
-        }
-    }
-    
-    suggestions
 }
 ```
 
