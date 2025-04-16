@@ -10,6 +10,8 @@ This RFC proposes extending the existing granular tool permissions system (propo
 2. command and argument-level permissions for the `execute_bash` and `use_aws` tools, and 
 3. a pattern-matching system that allows users to trust specific operation patterns without requiring confirmation for every similar action.
 
+Tool calls that do not pass the permissions check will require an acceptance prompt from the user.
+
 # Motivation
 
 [motivation]: #motivation
@@ -48,6 +50,7 @@ options:
 These commands provide a clear and consistent way to manage permissions by adding the concept of "rules", i.e. allow rules and block rules:
 - `allow` grants permission for a specific path, command, or AWS service operation
     - The specific path/command/operation (or pattern) must match an allowed rule.
+    - If there are no allowed patterns, then nothing will pass and everything will requie confirmation.
 - `block` explicitly blocks a specific path, command, or AWS operation (overrides allow rules).
     - This is not required to ensure that Amazon Q prompts for a tool. Rather, it allows the user to configure situations such as "allow all git commands ... except git push"
 - `remove-rule` removes a rule from either the allow or block list, resetting to default behavior for that path/command/operation
@@ -77,7 +80,7 @@ This allows Amazon Q to:
 - Write to `/path/to/output` and all its subdirectories without confirmation
 - Prompt to write to `/path/to/project/config` or its subdirectories (despite the broader allow rule existing)
 
-Path patterns support will support standard glob style syntax.
+Path patterns support will support standard glob style syntax. Paths will be stored and displayed as provided by the user, but all normalized to absolute paths when comparing against what is requested by the fs_read and fs_write tools.
 
 
 ## Command-Based Permissions
@@ -88,7 +91,7 @@ For the `execute_bash` tool, users can allow or block specific commands:
 /tools allow execute_bash --command "git status" "git pull * main"
 Trusted 2 commands for 'execute_bash'. I will **not** ask for confirmation before running these commands.
 
-/tools allow execute_bash --command "ls *"
+/tools allow execute_bash --command "ls*"
 Trusted 1 command for 'execute_bash'. I will **not** ask for confirmation before running this command.
 
 /tools block execute_bash --command "rm -rf *"
@@ -106,6 +109,8 @@ Command patterns support glob-style syntax:
 - `command *` matches the command with any arguments or options
 - `command arg1 *` matches the command with a specific first argument and any additional arguments or options
 - `command * arg1` matches the command with any arguments as long as the last argument is arg1
+
+Piped commands will be treated as separate commands like they currently are. All commands sent to a single `execute_bash` call must pass the allow to avoid confirmation.
 
 
 ## AWS CLI Permissions
@@ -133,6 +138,8 @@ This pattern-based approach is particularly useful for AWS operations, allowing 
 - Allow operations on specific services
 - Block sensitive services or operations
 
+Under the hood, this case will operate the same as Command-Based permissioning. This interface will be provided to users for convenience and clarity.
+
 
 ## Other tools
 
@@ -152,13 +159,14 @@ MCP tools are considered a black box and are given blanket trust/untrust permiss
 
 ## Viewing Current Permissions
 
-Users can see which tools are trusted (never prompt), untrusted (always prompt), or which tools have granular permission rules. This view displays the default permissions for tools if they are not changed. Tools from MCP are also listed here, however they are marked as `Trusted`/`Untrusted` only.
+Users can see which tools are trusted (never prompt), untrusted (always prompt), or which tools have granular permission rules. This view displays the default permissions for tools (if they are not changed), which includes what commands and operations are considered "readonly" by `execute_bash` and `use_aws`.
+Tools from MCP are also listed here, however they are marked as `Trusted`/`Untrusted` only.
 
 ```
 > /tools
 
 Current tools and permissions:
-  fs_read
+  fs_read:
     Trusted Paths
       ./*
       /users/me/documents/*
@@ -167,7 +175,7 @@ Current tools and permissions:
       ./data/secrets.txt
 
 
-  fs_write
+  fs_write:
     Trusted Paths
       <none>
 
@@ -175,7 +183,7 @@ Current tools and permissions:
       *
 
 
-  execute_bash
+  execute_bash:
     Trusted Commands
       git status
       git push
@@ -184,16 +192,15 @@ Current tools and permissions:
       git push -f
 
 
-  use_aws
+  use_aws:
     Trusted Services          Operations
       * (all)                  get*
-      s3.                      put*
+      s3                       put*
 
     Requires confirmation
       iam                      * (all)
 
-  report_issue
-    Trusted
+  report_issue: Trusted
 
   MCP Tools:
     - parse_markdown: Trusted
@@ -372,70 +379,93 @@ impl ToolPermissions {
         }
 
         match params {
-            Path(path_param) => {
-                for pattern in permission.blocked_patterns {
-                    if self.pattern_matches(pattern, path_param.path) {
+            ToolParams::Path(path_param) => {
+                // First check for explicit blocks
+                for pattern in &permission.blocked_patterns {
+                    if self.pattern_matches(pattern, path_param) {
                         // Match any blocked pattern to require acceptance
-                        return true
+                        return true;
                     }
                 }
-                for pattern in permission.allow_patterns {
-                    if self.pattern_matches(pattern, path_param.path) {
+                
+                // Then check for allows
+                for pattern in &permission.allowed_patterns {
+                    if self.pattern_matches(pattern, path_param) {
                         // Must match any allow to skip acceptance
-                        return false
+                        return false;
                     }
                 }
 
                 // Didn't match any allow patterns, need acceptance
-                return true
+                return true;
             },
-            Command(command_param) => {
+            ToolParams::Command(command_param) => {
                 // Gather piped commands
-                let commands: Vec<String> = t.command
+                let commands: Vec<String> = command_param
                     .split('|')
                     .map(|cmd| cmd.trim().to_string())
                     .collect();
 
-                for cmd in in commands {
-                    for pattern in permission.blocked_patterns {
-                        if self.pattern_matches(pattern, path_param.path) {
-                            return true
+                for cmd in &commands {
+                    // First check for explicit blocks
+                    for pattern in &permission.blocked_patterns {
+                        if self.pattern_matches(pattern, cmd) {
+                            return true;
                         }
                     }
-                    for pattern in permission.allow_patterns {
-                        if self.pattern_matches(pattern, path_param.path) {
-                            // Confirmed this command is fine, lets try next
-                            continue
+                    
+                    // Then check for allows
+                    let mut cmd_allowed = false;
+                    for pattern in &permission.allowed_patterns {
+                        if self.pattern_matches(pattern, cmd) {
+                            cmd_allowed = true;
+                            break;
                         }
                     }
-                    // This command wasn't matched by allow_patterns, return
-                    return true
+                    
+                    // If any command in the pipe isn't allowed, require acceptance
+                    if !cmd_allowed {
+                        return true;
+                    }
                 }
-                // Checked all commands without failing, we're good
-                return false
+                
+                // All commands in the pipe are allowed
+                return false;
             },
-            Empty => return true // Nothing to check and the tool isn't trusted - require acceptance
+            ToolParams::Empty => return true, // Nothing to check and the tool isn't trusted - require acceptance
         }
     }
 
-    fn add_rule_pattern(tool_name: &str, pattern: String, allow: bool) {
-        let permission = self.permissions.get_or_add(tool_name);
+    fn add_rule_pattern(&mut self, tool_name: &str, pattern: String, allow: bool) -> Result<()> {
+        let permission = self.permissions.entry(tool_name.to_string())
+            .or_insert_with(|| ToolPermission {
+                trusted: false,
+                allowed_patterns: HashSet::new(),
+                blocked_patterns: HashSet::new(),
+            });
+            
         if allow {
-            permission.allowed_patterns.insert(pattern)
+            permission.allowed_patterns.insert(pattern);
         } else {
-            permission.blocked_pattherns.insert(pattern)
+            permission.blocked_patterns.insert(pattern);
         }
         Ok(())
     }
 
-    fn remove_rule_pattern(tool_name: &str, pattern: String) {
-        let Some(permission) = self.permissions.get(tool_name) else {
-            return Err("Tool does not have permissions.")
+    fn remove_rule_pattern(&mut self, tool_name: &str, pattern: &str) -> Result<()> {
+        let permission = match self.permissions.get_mut(tool_name) {
+            Some(p) => p,
+            None => return Err(eyre::eyre!("Tool does not have permissions")),
+        };
+        
+        // Remove from both lists to simplify UX
+        let removed_from_allowed = permission.allowed_patterns.remove(pattern);
+        let removed_from_blocked = permission.blocked_patterns.remove(pattern);
+        
+        if !removed_from_allowed && !removed_from_blocked {
+            return Err(eyre::eyre!("Pattern not found in rules"));
         }
-        // Remove from both at a time to simplify UX
-        permission.allowed_patterns.remove(pattern)
-        permission.blocked_pattherns.remove(pattern)
-
+        
         Ok(())
     }
 }
@@ -518,18 +548,48 @@ fn handle_tools_command(&mut self, args: &str) -> Result<()> {
     }
     
     let parts: Vec<&str> = args.split_whitespace().collect();
-    match parts[1] {
+    match parts[0] {
         // ... existing commands
 
-        // implicit parsing
-        "allow" => {
-            self.tool_permissions.remove_rule_pattern(&parts[2..], true)?;
+        "allow" if parts.len() > 1 => {
+            let tool_name = parts[1];
+            let mut path = None;
+            let mut command = None;
+            let mut service = None;
+            let mut operation = None;
+            
+            // Parse remaining arguments
+            for i in 2..parts.len() {
+                if parts[i] == "--path" && i + 1 < parts.len() {
+                    path = Some(parts[i + 1]);
+                } else if parts[i] == "--command" && i + 1 < parts.len() {
+                    command = Some(parts[i + 1]);
+                } else if parts[i] == "--service" && i + 1 < parts.len() {
+                    service = Some(parts[i + 1]);
+                } else if parts[i] == "--operation" && i + 1 < parts.len() {
+                    operation = Some(parts[i + 1]);
+                }
+            }
+            
+            // Add appropriate rule based on tool and arguments
+            if let Some(p) = path {
+                self.tool_permissions.add_rule_pattern(tool_name, p.to_string(), true)?;
+            } else if let Some(cmd) = command {
+                self.tool_permissions.add_rule_pattern(tool_name, cmd.to_string(), true)?;
+            } else if let (Some(svc), Some(op)) = (service, operation) {
+                let pattern = format!("{} {}", svc, op);
+                self.tool_permissions.add_rule_pattern(tool_name, pattern, true)?;
+            } else {
+                return Err(eyre::eyre!("Missing required arguments for allow command"));
+            }
         },
-        "block" => {
-            self.tool_permissions.add_rule_pattern(&parts[2..], false)?;
+        "block" if parts.len() > 1 => {
+            // Similar implementation to "allow" but with is_allowed=false
+            // ...
         },
-        "remove-rule" => {
-            self.tool_permissions.remove_rule_pattern(&parts[2..])?;
+        "remove-rule" if parts.len() > 1 => {
+            // Similar implementation to parse arguments and call remove_rule_pattern
+            // ...
         },
         // Other commands...
         _ => {
@@ -566,61 +626,70 @@ fn prompt_for_tool_execution(&mut self, tool_name: &str, params: &Value) -> Resu
 fn handle_command_rule_creation(&mut self, tool_name: &str, params: &Value) -> Result<ToolPromptResponse> {
     execute!(
         self.output,
+        style::Print("Create rule for: execute_bash (command=git status)\n"),
+        style::Print("Trusted commands do not ask for confirmation before running.\n\n"),
         style::Print("1. Trust this exact command only\n"),
-        style::Print(format!("2. Trust all '{}' commands with any arguments\n", params.command)),
-        style::Print(format!("3. Trust all '{}' commands\n", base_command(params.command))),
+        style::Print(format!("2. Trust all '{}' commands with any arguments\n", base_command(params.command))),
+        style::Print(format!("3. Trust all '{}' commands\n", base_command(params.command).split_whitespace().next().unwrap_or(""))),
         style::Print(format!("4. Trust all requests from this tool '{}'\n", tool_name)),
-        style::Print("Or, 'y' to run without adding a rule:"),
+        style::Print("Or, 'y' to run without adding a rule: "),
     )?;
 
     // Read user input and return appropriate response
-    match user_input {
+    let choice = self.read_line()?;
+    match choice.trim() {
         "1" => {
-            self.tool_permissions.add_rule_pattern(tool_name, params.command);
-            ChatState::ToolUseExecute()
+            self.tool_permissions.add_rule_pattern(tool_name, params.command.to_string(), true)?;
+            Ok(ToolPromptResponse::Yes)
         },
         "2" => {
-            self.tool_permissions.add_rule_pattern(tool_name, format!("{}*", params.command));
-            ChatState::ToolUseExecute()
+            let base_cmd = base_command(params.command);
+            self.tool_permissions.add_rule_pattern(tool_name, format!("{} *", base_cmd), true)?;
+            Ok(ToolPromptResponse::Yes)
         },
         "3" => {
-            self.tool_permissions.add_rule_pattern(tool_name, base_command(params.command));
-            ChatState::ToolUseExecute()
+            let cmd_name = base_command(params.command).split_whitespace().next().unwrap_or("");
+            self.tool_permissions.add_rule_pattern(tool_name, format!("{} *", cmd_name), true)?;
+            Ok(ToolPromptResponse::Yes)
         },
         "4" => {
-            self.tool_permissions.trust(tool_name);
-            ChatState::ToolUseExecute()
+            self.tool_permissions.trust_tool(tool_name);
+            Ok(ToolPromptResponse::Yes)
         },
-        "y" -> ChatState::ToolUseExecute()
-        _ -> ChatState::HandleInput(user_input)
+        "y" => Ok(ToolPromptResponse::Yes),
+        _ => Ok(ToolPromptResponse::No)
     }
 }
 
 fn handle_filesystem_rule_creation(&mut self, tool_name: &str, params: &Value) -> Result<ToolPromptResponse> {
     execute!(
         self.output,
+        style::Print("Create rule for: fs_write (path=/users/me/my/project/test.txt)\n"),
+        style::Print("Trusted paths do not ask for confirmation before writing.\n\n"),
         style::Print("1. Trust this exact path only\n"),
-        style::Print(format!("2. Trust all '{}' commands\n", base_command(params.command))),
+        style::Print(format!("2. Trust the current directory ({})\n", current_dir().display())),
         style::Print(format!("3. Trust all requests from this tool '{}'\n", tool_name)),
-        style::Print("Or, 'y' to run without adding a rule:"),
+        style::Print("Or, 'y' to run without adding a rule: "),
     )?;
 
     // Read user input and return appropriate response
-    match user_input {
+    let choice = self.read_line()?;
+    match choice.trim() {
         "1" => {
-            self.tool_permissions.add_rule_pattern(tool_name, params.path);
-            ChatState::ToolUseExecute()
+            self.tool_permissions.add_rule_pattern(tool_name, params.path.to_string(), true)?;
+            Ok(ToolPromptResponse::Yes)
         },
         "2" => {
-            self.tool_permissions.add_rule_pattern(tool_name, pwd());
-            ChatState::ToolUseExecute()
+            let current_dir = current_dir()?;
+            self.tool_permissions.add_rule_pattern(tool_name, format!("{}/*", current_dir.display()), true)?;
+            Ok(ToolPromptResponse::Yes)
         },
         "3" => {
-            self.tool_permissions.trust(tool_name);
-            ChatState::ToolUseExecute()
+            self.tool_permissions.trust_tool(tool_name);
+            Ok(ToolPromptResponse::Yes)
         },
-        "y" -> ChatState::ToolUseExecute()
-        _ -> ChatState::HandleInput(user_input)
+        "y" => Ok(ToolPromptResponse::Yes),
+        _ => Ok(ToolPromptResponse::No)
     }
 }
 
@@ -741,7 +810,7 @@ Without this feature:
 
 [unresolved-questions]: #unresolved-questions
 
-1. **Pattern Syntax Details**: What specific pattern syntax should we use? Should we adopt an existing library like `globset` or implement our own pattern matching? How should we handle edge cases like case sensitivity and special characters?
+1. **Pattern Syntax Details**: What specific pattern syntax should we use? Should we adopt an existing library like `globset` or implement our own pattern matching? How should we handle edge cases like case sensitivity and special characters? How will pattern matching hold up with paths on different operating systems?
 
 2. **Rule Management Interface**: What's the most user-friendly way to allow users to manage (list, edit, delete) existing rules?
 
