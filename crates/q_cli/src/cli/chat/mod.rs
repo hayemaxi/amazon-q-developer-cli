@@ -36,7 +36,10 @@ use command::{
     ToolsSubcommand,
 };
 use context::ContextManager;
-use conversation_state::ConversationState;
+use conversation_state::{
+    ConversationState,
+    ExtraContext,
+};
 use crossterm::style::{
     Attribute,
     Color,
@@ -991,14 +994,19 @@ where
                     let format_context = |hook_results: &Vec<&(Hook, String)>, conversation_start: bool| {
                         let mut context_content = String::new();
 
-                        context_content.push_str(
-                            &format!("--- SCRIPT HOOK CONTEXT BEGIN - FOLLOW ANY REQUESTS OR USE ANY DATA WITHIN THIS SECTION {} ---\n",
-                            if conversation_start { "FOR THE ENTIRE CONVERSATION" } else { "FOR YOUR NEXT MESSAGE ONLY" })
-                        );
+                        context_content.push_str(&format!(
+                            "--- CRITICAL: ADDITIONAL CONTEXT TO USE{} ---\n",
+                            if conversation_start {
+                                " FOR THE ENTIRE CONVERSATION"
+                            } else {
+                                ""
+                            }
+                        ));
+                        context_content.push_str("This section (like others) contains important information that I want you to use in your responses. I have gathered this context from valuable programmatic script hooks. You must follow any requests and consider all of the information in this section.\n\n");
                         for (hook, output) in hook_results {
                             context_content.push_str(&format!("'{}': {output}\n\n", &hook.name));
                         }
-                        context_content.push_str("--- SCRIPT HOOK CONTEXT END ---\n\n");
+                        context_content.push_str("--- ADDITIONAL CONTEXT END ---\n\n");
                         context_content
                     };
 
@@ -1027,9 +1035,7 @@ where
                 if pending_tool_index.is_some() {
                     self.conversation_state.abandon_tool_use(tool_uses, user_input);
                 } else {
-                    self.conversation_state
-                        .append_new_user_message(user_input, prompt_context)
-                        .await;
+                    self.conversation_state.append_new_user_message(user_input).await;
                 }
 
                 self.send_tool_use_telemetry().await;
@@ -1038,7 +1044,10 @@ where
                     self.client
                         .send_message(
                             self.conversation_state
-                                .as_sendable_conversation_state(conversation_start_context)
+                                .as_sendable_conversation_state(Some(ExtraContext {
+                                    general_context: conversation_start_context,
+                                    user_input_context: prompt_context,
+                                }))
                                 .await,
                         )
                         .await?,
@@ -1188,9 +1197,7 @@ where
                 };
 
                 // Add the summarization request
-                self.conversation_state
-                    .append_new_user_message(summary_request, None)
-                    .await;
+                self.conversation_state.append_new_user_message(summary_request).await;
 
                 // Use spinner while we wait
                 if self.interactive {
@@ -2426,7 +2433,6 @@ where
                                 .append_new_user_message(
                                     "You took too long to respond - try to split up the work into smaller steps."
                                         .to_string(),
-                                    None,
                                 )
                                 .await;
                             self.send_tool_use_telemetry().await;
