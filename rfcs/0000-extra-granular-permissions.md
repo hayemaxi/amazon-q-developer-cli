@@ -53,8 +53,6 @@ These commands manage "rules" that control tool permissions:
 - `block` explicitly blocks specific paths, commands, or operations (overrides allow rules)
 - `remove-rule` removes a rule from the allow and block lists
 
-The existing `/tools trust` and `/tools untrust` commands remain as shortcuts for allowing or blocking everything.
-
 Aligned with existing functionality, tools can be completely trusted using `/tools trust`, which would be the equivalent of allowing all paths/commands. Tools can also be completely untrusted using `/tools untrust`, which would be the equivalent of blocking all paths/commands.
 
 Note: Not all options apply to each tool. To make it clear to the user what sort of permissions they are granting, explicit and tool-specific options are necessary.
@@ -64,7 +62,7 @@ Note: Not all options apply to each tool. To make it clear to the user what sort
 Users can specify allowed and blocked paths for filesystem operations:
 
 ```
-/tools allow fs_read --path /path/to/project/** /path/to/project2/**
+/tools allow fs_read --path /path/to/project /path/to/project2/**
 Trusted 2 paths for 'fs_write'. I will **not** ask for confirmation before running this tool with these paths.
 
 /tools allow fs_write --path /path/to/output/**
@@ -79,7 +77,7 @@ This allows Amazon Q to:
 - Write to `/path/to/output` and all its subdirectories without confirmation
 - Prompt to write to `/path/to/project/config` or its subdirectories (despite the broader allow rule existing)
 
-Path patterns support standard glob syntax and are normalized to absolute paths when comparing.
+Path patterns support standard glob syntax and are normalized to absolute paths when comparing. Direct paths to folders will include all subcontent (i.e. /my/folder == /my/folder/**)
 
 ### Command-Based Permissions
 
@@ -95,11 +93,11 @@ Blocked 1 command for 'execute_bash'. I **will** ask for confirmation before run
 
 This allows Amazon Q to:
 - Run any `git status` or `rm` without confirmation
-- Prompt to run `rm -rf` (even if broader permissions exist)
+- Prompt to run `rm -rf` (even though we allowed `rm`)
 
-Command patterns will match by prefix (`.startswith`). For example `git` and `git status` will match `git status -s`.
+Command patterns will match by prefix (i.e. `.startswith()`). For example `git` and `git status` will match `git status -s`.
 
-Piped commands will be treated as separate commands. All commands sent to a single `execute_bash` call must pass the allow to avoid confirmation.
+Piped commands will be treated as separate commands. All commands sent to a single `execute_bash` call must pass the allow rules to avoid confirmation.
 
 
 ### AWS CLI Permissions
@@ -107,13 +105,13 @@ Piped commands will be treated as separate commands. All commands sent to a sing
 For the `use_aws` tool, users can allow or block specific service/operation combinations:
 
 ```
-/tools allow use_aws --service=s3 --operation="get*"
+/tools allow use_aws --service s3 --operation "get*"
 Trusted 1 command for 'use_aws'. I will **not** ask for confirmation before running this command.
 
-/tools allow use_aws --service="*" --operation="describe*"
+/tools allow use_aws --service "*" --operation "describe*"
 Trusted 1 command for 'use_aws'. I will **not** ask for confirmation before running this command.
 
-/tools block use_aws --service=iam --operation="*"
+/tools block use_aws --service iam --operation "*"
 Blocked 1 command for 'use_aws'. I **will** ask for confirmation before running this command.
 ```
 
@@ -122,7 +120,7 @@ This allows Amazon Q to:
 - Run any `describe` operations on any service without confirmation
 - Prompt to run any IAM operations
 
-This pattern match will be similar to glob style matching, allowing the use of "*" to as a wildcard for matching on services or operations. This is useful for AWS operations, allowing:
+This pattern match will be similar to glob style matching, allowing the use of "*" to as a wildcard for matching on services or operations. This is useful for AWS operations by enabling users to:
 - Allow all read-only operations (`get*`, `describe*`, `list*`)
 - Allow operations on specific services, or all services with "*"
 - Block sensitive services or operations
@@ -142,7 +140,7 @@ Error: 'report_issue' does not use path permissions. Use `/tools [trust/untrust]
 
 ### Custom tools from MCP
 
-MCP tools are considered a black box and are given blanket trust/untrust permissions only. Their permissions can only be controlled with the current implementation of `/tools trust` and `/tools untrust`. By default, these tools are marked as `Trusted`
+MCP tools are considered a black box and are given blanket trust/untrust permissions only. Like non-granular built-in tools, their permissions can only be controlled with the current implementation of `/tools trust` and `/tools untrust`. By default, these tools are marked as `Trusted`.
 
 
 ## Viewing Current Permissions
@@ -217,6 +215,23 @@ Current tools and permissions from MCP:
   - talk_to_other_ai: Per-request
 ```
 
+### Default Permissions
+
+Starting Q CLI with no permission adjustments will yield the following permissions for each built-in tool. They would display using the `/tools` command:
+- fs_read
+  - allow: *
+  - block:
+- fs_write
+  - allow:
+  - block: *
+- execute_bash:
+  - allow: ls, cat, echo... (all current readonly commands)
+  - block:
+- use_aws:
+  - allow: (service=\*, operation="get\*,ls\*, ...") (all current readonly operations)
+  - block:
+- report_issue: Trusted
+
 
 ## Rule Removal
 
@@ -281,20 +296,20 @@ Create rule for: fs_write (write=/users/me/my/project/test.txt)
 Trusted paths do not ask for confirmation before writing.
 
 1. Trust this exact path only
-2. Trust the current directory (/users/me/)
+2. Trust the current directory (/users/me/)         # if the path in question is within the current directory, otherwise prompt for the parent of the target file
 3. Trust all requests from this tool 'fs_write'
 Or, 'y' to run without adding a rule:
 ```
 
 For use_aws, this might look like:
 ```
-Create rule for: fs_write (s3 list-buckets)
+Create rule for: use_aws (s3 list-buckets)
 Trusted paths do not ask for confirmation before writing.
 
 1. Trust this exact command only
 2. Trust the all list* operations for s3
 3. Trust the all list* operations for any service
-4. Trust all requests from this tool 'fs_write'
+4. Trust all requests from this tool 'use_aws'
 Or, 'y' to run without adding a rule:
 ```
 
