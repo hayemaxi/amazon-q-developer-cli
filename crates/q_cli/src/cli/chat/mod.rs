@@ -9,6 +9,7 @@ mod prompt;
 mod skim_integration;
 mod summarization_state;
 mod tools;
+mod execute_command;
 
 use std::borrow::Cow;
 use std::collections::{
@@ -54,6 +55,7 @@ use crossterm::{
     terminal,
 };
 use dialoguer::console::strip_ansi_codes;
+use execute_command::ExecuteShellCommand;
 use eyre::{
     ErrReport,
     Result,
@@ -1067,7 +1069,9 @@ where
             },
             Command::Execute { command } => {
                 queue!(self.output, style::Print('\n'))?;
-                std::process::Command::new("bash").args(["-c", &command]).status().ok();
+                // std::process::Command::new("bash").args(["-c", &command]).status().ok();
+                // ExecuteShellCommand::invoke(&command, &mut self.output).await.ok();
+                ExecuteShellCommand::invoke2(&command).await.ok();
                 queue!(self.output, style::Print('\n'))?;
                 ChatState::PromptUser {
                     tool_uses: None,

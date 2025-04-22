@@ -15,6 +15,7 @@ default = []
 wayland = ["arboard/wayland-data-control"]
 
 [dependencies]
+anyhow.workspace = true
 amzn-codewhisperer-client.workspace = true
 amzn-codewhisperer-streaming-client.workspace = true
 anstream.workspace = true
@@ -62,6 +63,11 @@ indoc.workspace = true
 mimalloc.workspace = true
 owo-colors = "4.2.0"
 parking_lot.workspace = true
+portable-pty.workspace = true
+termios = "0.3"
+nix = "0.26"
+filedescriptor = "0.8.3"
+console = "0.15.11"
 rand.workspace = true
 regex.workspace = true
 rustyline = { version = "15.0.0", features = ["derive", "custom-bindings"] }
