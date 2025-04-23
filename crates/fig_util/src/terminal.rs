@@ -2,11 +2,71 @@ use std::borrow::Cow;
 use std::fmt;
 use std::sync::OnceLock;
 
+use anyhow::Context as _;
 use fig_os_shim::Context;
 use serde::{
     Deserialize,
     Serialize,
 };
+use std::io::{
+    self,
+    Read,
+    Write,
+};
+use std::os::unix::io::{
+    AsRawFd,
+    FromRawFd,
+    RawFd,
+};
+use std::os::unix::process::CommandExt;
+use std::path::Path;
+
+use async_trait::async_trait;
+use filedescriptor::FileDescriptor;
+use nix::fcntl::{
+    FcntlArg,
+    FdFlag,
+    OFlag,
+    fcntl,
+    open,
+};
+use nix::libc;
+use nix::pty::{
+    PtyMaster,
+    Winsize,
+    grantpt,
+    posix_openpt,
+    ptsname,
+    unlockpt,
+};
+use nix::sys::signal::{
+    SigHandler,
+    Signal,
+    signal,
+};
+use nix::sys::stat::{
+    Mode,
+    umask,
+};
+use portable_pty::unix::close_random_fds;
+use portable_pty::{
+    Child,
+    PtySize,
+};
+use tokio::io::unix::AsyncFd;
+
+use std::collections::BTreeMap;
+use std::ffi::{
+    OsStr,
+    OsString,
+};
+#[cfg(windows)]
+use std::os::windows::ffi::OsStrExt;
+
+#[cfg(unix)]
+use cfg_if::cfg_if;
+
+nix::ioctl_write_ptr_bad!(ioctl_tiocswinsz, libc::TIOCSWINSZ, Winsize);
 
 /// Terminals that macOS supports
 pub const MACOS_TERMINALS: &[Terminal] = &[
@@ -792,6 +852,598 @@ impl IntelliJVariant {
         })
     }
 }
+
+
+struct UnixSlavePty {
+    name: String,
+    fd: FileDescriptor,
+}
+
+struct UnixMasterPty {
+    fd: PtyMaster,
+}
+
+struct UnixAsyncMasterPty {
+    fd: AsyncFd<PtyMaster>,
+}
+
+/// Helper function to set the close-on-exec flag for a raw descriptor
+fn cloexec(fd: RawFd) -> anyhow::Result<()> {
+    let flags = fcntl(fd, FcntlArg::F_GETFD)?;
+    fcntl(
+        fd,
+        FcntlArg::F_SETFD(FdFlag::from_bits_truncate(flags) | FdFlag::FD_CLOEXEC),
+    )?;
+    Ok(())
+}
+
+/// Open a pseudoterminal
+pub fn open_pty(pty_size: &PtySize) -> anyhow::Result<PtyPair> {
+    // Open a new pseudoterminal master
+    // The pseudoterminal must be initialized with O_NONBLOCK since on macOS, the
+    // it can not be safely set with fcntl() later on.
+    // https://github.com/pkgw/stund/blob/master/tokio-pty-process/src/lib.rs#L127-L133
+    cfg_if::cfg_if! {
+        if #[cfg(any(target_os = "macos", target_os = "linux"))] {
+            let oflag = OFlag::O_RDWR | OFlag::O_NONBLOCK;
+        } else if #[cfg(target_os = "freebsd")] {
+            let oflag = OFlag::O_RDWR;
+        }
+    }
+    let master_pty: PtyMaster = posix_openpt(oflag).context("Failed to openpt")?;
+
+    // Allow pseudoterminal pair to be generated
+    grantpt(&master_pty).context("Failed to grantpt")?;
+    unlockpt(&master_pty).context("Failed to unlockpt")?;
+
+    // Get the name of the pseudoterminal
+    // SAFETY: This is done before any threads are spawned, thus it being
+    // non thread safe is not an issue
+    let pty_name = unsafe { ptsname(&master_pty) }?;
+    let slave_pty = open(Path::new(&pty_name), OFlag::O_RDWR, Mode::empty())?;
+
+    // let termios = tcgetattr(STDIN_FILENO)
+    //    .context("Failed to get terminal attributes")?;
+    // tcsetattr(slave_pty, SetArg::TCSANOW, termios)?;
+    let winsize = Winsize {
+        ws_row: pty_size.rows,
+        ws_col: pty_size.cols,
+        ws_xpixel: pty_size.pixel_width,
+        ws_ypixel: pty_size.pixel_height,
+    };
+    unsafe { ioctl_tiocswinsz(slave_pty, &winsize) }?;
+
+    #[cfg(target_os = "freebsd")]
+    set_nonblocking(master_pty.as_raw_fd()).context("Failed to set nonblocking")?;
+
+    let master = UnixMasterPty { fd: master_pty };
+    let slave = UnixSlavePty {
+        name: pty_name,
+        fd: unsafe { FileDescriptor::from_raw_fd(slave_pty) },
+    };
+
+    // Ensure that these descriptors will get closed when we execute
+    // the child process. This is done after constructing the Pty
+    // instances so that we ensure that the Ptys get drop()'d if
+    // the cloexec() functions fail (unlikely!).
+    cloexec(master.fd.as_raw_fd())?;
+    cloexec(slave.fd.as_raw_fd())?;
+
+    Ok(PtyPair {
+        master: Box::new(master),
+        slave: Box::new(slave),
+    })
+}
+
+impl SlavePty for UnixSlavePty {
+    fn spawn_command(&self, builder: CommandBuilder) -> anyhow::Result<Box<dyn Child + Send + Sync>> {
+        let configured_mask = builder.umask;
+        let mut cmd = builder.as_command()?;
+
+        cmd.stdin(self.fd.as_stdio()?)
+            .stdout(self.fd.as_stdio()?)
+            .stderr(self.fd.as_stdio()?);
+
+        let pre_exec_fn = move || {
+            // Clean up a few things before we exec the program
+            // Clear out any potentially problematic signal
+            // dispositions that we might have inherited
+            for signo in [
+                Signal::SIGCHLD,
+                Signal::SIGHUP,
+                Signal::SIGINT,
+                Signal::SIGQUIT,
+                Signal::SIGTERM,
+                Signal::SIGALRM,
+            ] {
+                unsafe { signal(signo, SigHandler::SigDfl) }?;
+            }
+
+            // Establish ourselves as a session leader.
+            nix::unistd::setsid()?;
+
+            // Clippy wants us to explicitly cast TIOCSCTTY using
+            // type::from(), but the size and potentially signedness
+            // are system dependent, which is why we're using `as _`.
+            // Suppress this lint for this section of code.
+            {
+                // Set the pty as the controlling terminal.
+                // Failure to do this means that delivery of
+                // SIGWINCH won't happen when we resize the
+                // terminal, among other undesirable effects.
+                if unsafe { libc::ioctl(0, libc::TIOCSCTTY as _, 0) == -1 } {
+                    return Err(io::Error::last_os_error());
+                }
+            }
+
+            close_random_fds();
+
+            if let Some(mode) = configured_mask {
+                umask(mode);
+            }
+
+            Ok(())
+        };
+
+        unsafe { cmd.pre_exec(pre_exec_fn) };
+
+        let mut child = cmd.spawn()?;
+
+        // Ensure that we close out the slave fds that Child retains;
+        // they are not what we need (we need the master side to reference
+        // them) and won't work in the usual way anyway.
+        // In practice these are None, but it seems best to be move them
+        // out in case the behavior of Command changes in the future.
+        child.stdin.take();
+        child.stdout.take();
+        child.stderr.take();
+
+        Ok(Box::new(child))
+    }
+
+    fn get_name(&self) -> Option<String> {
+        Some(self.name.clone())
+    }
+}
+
+#[async_trait]
+impl AsyncMasterPty for UnixAsyncMasterPty {
+    async fn read(&mut self, buff: &mut [u8]) -> io::Result<usize> {
+        loop {
+            let mut guard = self.fd.readable_mut().await?;
+
+            match guard.try_io(|inner| inner.get_mut().read(buff)) {
+                Ok(result) => return result,
+                Err(_would_block) => continue,
+            }
+        }
+    }
+
+    async fn write(&mut self, buff: &[u8]) -> io::Result<usize> {
+        loop {
+            let mut guard = self.fd.writable_mut().await?;
+
+            match guard.try_io(|inner| inner.get_mut().write(buff)) {
+                Ok(result) => return result,
+                Err(_would_block) => continue,
+            }
+        }
+    }
+
+    fn resize(&self, size: PtySize) -> anyhow::Result<()> {
+        let ws_size = Winsize {
+            ws_row: size.rows,
+            ws_col: size.cols,
+            ws_xpixel: size.pixel_width,
+            ws_ypixel: size.pixel_height,
+        };
+
+        let fd = self.fd.as_raw_fd();
+        let res = unsafe { libc::ioctl(fd, libc::TIOCSWINSZ as _, &ws_size as *const _) };
+
+        if res != 0 {
+            anyhow::bail!("failed to ioctl(TIOCSWINSZ): {:?}", io::Error::last_os_error());
+        }
+
+        Ok(())
+    }
+}
+
+impl MasterPty for UnixMasterPty {
+    fn get_async_master_pty(self: Box<Self>) -> anyhow::Result<Box<dyn AsyncMasterPty + Send + Sync>> {
+        Ok(Box::new(UnixAsyncMasterPty {
+            fd: AsyncFd::new(self.fd).context("Failed to create AsyncFd")?,
+        }))
+    }
+}
+
+impl AsRawFd for UnixMasterPty {
+    fn as_raw_fd(&self) -> RawFd {
+        self.fd.as_raw_fd()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, PartialOrd)]
+struct EnvEntry {
+    /// Whether or not this environment variable came from the base environment,
+    /// as opposed to having been explicitly set by the caller.
+    is_from_base_env: bool,
+
+    /// For case-insensitive platforms, the environment variable key in its preferred casing.
+    preferred_key: OsString,
+
+    /// The environment variable value.
+    value: OsString,
+}
+
+impl EnvEntry {
+    fn map_key(k: OsString) -> OsString {
+        cfg_if! {
+            if #[cfg(windows)] {
+                // Best-effort lowercase transformation of an os string
+                match k.to_str() {
+                    Some(s) => s.to_lowercase().into(),
+                    None => k,
+                }
+            } else {
+                k
+            }
+        }
+    }
+}
+
+fn get_base_env() -> BTreeMap<OsString, EnvEntry> {
+    std::env::vars_os()
+        .map(|(key, value)| {
+            (EnvEntry::map_key(key.clone()), EnvEntry {
+                is_from_base_env: true,
+                preferred_key: key,
+                value,
+            })
+        })
+        .collect()
+}
+
+/// `CommandBuilder` is used to prepare a command to be spawned into a pty.
+/// The interface is intentionally similar to that of `std::process::Command`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CommandBuilder {
+    args: Vec<OsString>,
+    envs: BTreeMap<OsString, EnvEntry>,
+    cwd: Option<OsString>,
+    #[cfg(unix)]
+    pub umask: Option<nix::sys::stat::Mode>,
+}
+
+impl CommandBuilder {
+    /// Create a new builder instance with `argv[0]` set to the specified
+    /// program.
+    pub fn new<S: AsRef<OsStr>>(program: S) -> Self {
+        Self {
+            args: vec![program.as_ref().to_owned()],
+            envs: get_base_env(),
+            cwd: None,
+            #[cfg(unix)]
+            umask: None,
+        }
+    }
+
+    /// Create a new builder instance from a pre-built argument vector
+    pub fn from_argv(args: Vec<OsString>) -> Self {
+        Self {
+            args,
+            envs: get_base_env(),
+            cwd: None,
+            #[cfg(unix)]
+            umask: None,
+        }
+    }
+
+    /// Create a new builder instance that will run some idea of a default
+    /// program.  Such a builder will panic if `arg` is called on it.
+    pub fn new_default_prog() -> Self {
+        Self {
+            args: vec![],
+            envs: get_base_env(),
+            cwd: None,
+            #[cfg(unix)]
+            umask: None,
+        }
+    }
+
+    /// Returns true if this builder was created via `new_default_prog`
+    pub fn is_default_prog(&self) -> bool {
+        self.args.is_empty()
+    }
+
+    /// Append an argument to the current command line.
+    /// Will panic if called on a builder created via `new_default_prog`.
+    pub fn arg<S: AsRef<OsStr>>(&mut self, arg: S) {
+        if self.is_default_prog() {
+            panic!("attempted to add args to a default_prog builder");
+        }
+        self.args.push(arg.as_ref().to_owned());
+    }
+
+    /// Append a sequence of arguments to the current command line
+    pub fn args<I, S>(&mut self, args: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        for arg in args {
+            self.arg(arg);
+        }
+    }
+
+    pub fn get_argv(&self) -> &Vec<OsString> {
+        &self.args
+    }
+
+    pub fn get_argv_mut(&mut self) -> &mut Vec<OsString> {
+        &mut self.args
+    }
+
+    /// Override the value of an environmental variable
+    pub fn env<K, V>(&mut self, key: K, value: V)
+    where
+        K: AsRef<OsStr>,
+        V: AsRef<OsStr>,
+    {
+        let key: OsString = key.as_ref().into();
+        let value: OsString = value.as_ref().into();
+        self.envs.insert(EnvEntry::map_key(key.clone()), EnvEntry {
+            is_from_base_env: false,
+            preferred_key: key,
+            value,
+        });
+    }
+
+    pub fn env_remove<K>(&mut self, key: K)
+    where
+        K: AsRef<OsStr>,
+    {
+        let key = key.as_ref().into();
+        self.envs.remove(&EnvEntry::map_key(key));
+    }
+
+    pub fn env_clear(&mut self) {
+        self.envs.clear();
+    }
+
+    fn get_env<K>(&self, key: K) -> Option<&OsStr>
+    where
+        K: AsRef<OsStr>,
+    {
+        let key = key.as_ref().into();
+        self.envs.get(&EnvEntry::map_key(key)).map(
+            |EnvEntry {
+                 is_from_base_env: _,
+                 preferred_key: _,
+                 value,
+             }| value.as_os_str(),
+        )
+    }
+
+    pub fn cwd<D>(&mut self, dir: D)
+    where
+        D: AsRef<OsStr>,
+    {
+        self.cwd = Some(dir.as_ref().to_owned());
+    }
+
+    pub fn clear_cwd(&mut self) {
+        self.cwd.take();
+    }
+
+    pub fn get_cwd(&self) -> Option<&OsString> {
+        self.cwd.as_ref()
+    }
+
+    /// Iterate over the configured environment. Only includes environment
+    /// variables set by the caller via `env`, not variables set in the base
+    /// environment.
+    pub fn iter_extra_env_as_str(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.envs.values().filter_map(
+            |EnvEntry {
+                 is_from_base_env,
+                 preferred_key,
+                 value,
+             }| {
+                if *is_from_base_env {
+                    None
+                } else {
+                    let key = preferred_key.to_str()?;
+                    let value = value.to_str()?;
+                    Some((key, value))
+                }
+            },
+        )
+    }
+
+    /// Return the configured command and arguments as a single string,
+    /// quoted per the unix shell conventions.
+    pub fn as_unix_command_line(&self) -> anyhow::Result<String> {
+        let mut strs = vec![];
+        for arg in &self.args {
+            let s = arg
+                .to_str()
+                .ok_or_else(|| anyhow::anyhow!("argument cannot be represented as utf8"))?;
+            strs.push(s);
+        }
+        shlex::try_join(strs).map_err(|e| anyhow::anyhow!("Failed to join command arguments: {}", e))
+    }
+}
+
+#[cfg(unix)]
+impl CommandBuilder {
+    pub fn umask(&mut self, mask: Option<nix::sys::stat::Mode>) {
+        self.umask = mask;
+    }
+
+    fn resolve_path(&self) -> Option<&OsStr> {
+        self.get_env("PATH")
+    }
+
+    fn search_path(&self, exe: &OsStr, cwd: &OsStr) -> anyhow::Result<OsString> {
+        use std::path::Path;
+        let exe_path: &Path = exe.as_ref();
+        if exe_path.is_relative() {
+            let cwd: &Path = cwd.as_ref();
+            let abs_path = cwd.join(exe_path);
+            if abs_path.exists() {
+                return Ok(abs_path.into_os_string());
+            }
+
+            if let Some(path) = self.resolve_path() {
+                for path in std::env::split_paths(&path) {
+                    let candidate = path.join(exe);
+                    if candidate.exists() {
+                        return Ok(candidate.into_os_string());
+                    }
+                }
+            }
+            anyhow::bail!(
+                "Unable to spawn {} because it doesn't exist on the filesystem \
+                and was not found in PATH",
+                exe_path.display()
+            );
+        } else {
+            if !exe_path.exists() {
+                anyhow::bail!(
+                    "Unable to spawn {} because it doesn't exist on the filesystem",
+                    exe_path.display()
+                );
+            }
+
+            Ok(exe.to_owned())
+        }
+    }
+
+    /// Convert the CommandBuilder to a `std::process::Command` instance.
+    pub fn as_command(&self) -> anyhow::Result<std::process::Command> {
+        use std::os::unix::process::CommandExt;
+
+        let home = self.get_home_dir()?;
+        let dir: &OsStr = self
+            .cwd
+            .as_deref()
+            .filter(|dir| std::path::Path::new(dir).is_dir())
+            .unwrap_or_else(|| home.as_ref());
+
+        let mut cmd = if self.is_default_prog() {
+            let shell = self.get_shell()?;
+
+            let mut cmd = std::process::Command::new(&shell);
+
+            // Run the shell as a login shell by prefixing the shell's
+            // basename with `-` and setting that as argv0
+            let basename = shell.rsplit('/').next().unwrap_or(&shell);
+            cmd.arg0(format!("-{basename}"));
+            cmd
+        } else {
+            let resolved = self.search_path(&self.args[0], dir)?;
+            let mut cmd = std::process::Command::new(resolved);
+            cmd.arg0(&self.args[0]);
+            cmd.args(&self.args[1..]);
+            cmd
+        };
+
+        cmd.current_dir(dir);
+
+        cmd.env_clear();
+        cmd.envs(self.envs.values().map(
+            |EnvEntry {
+                 is_from_base_env: _,
+                 preferred_key,
+                 value,
+             }| (preferred_key.as_os_str(), value.as_os_str()),
+        ));
+
+        Ok(cmd)
+    }
+
+    /// Determine which shell to run.
+    /// We take the contents of the $SHELL env var first, then
+    /// fall back to looking it up from the password database.
+    pub fn get_shell(&self) -> anyhow::Result<String> {
+        if let Some(shell) = self.get_env("SHELL").and_then(OsStr::to_str) {
+            return Ok(shell.into());
+        }
+
+        let ent = unsafe { libc::getpwuid(libc::getuid()) };
+        if ent.is_null() {
+            Ok("/bin/sh".into())
+        } else {
+            use std::ffi::CStr;
+            use std::str;
+            let shell = unsafe { CStr::from_ptr((*ent).pw_shell) };
+            shell.to_str().map(str::to_owned).context("failed to resolve shell")
+        }
+    }
+
+    fn get_home_dir(&self) -> anyhow::Result<String> {
+        if let Some(home_dir) = self.get_env("HOME").and_then(OsStr::to_str) {
+            return Ok(home_dir.into());
+        }
+
+        let ent = unsafe { libc::getpwuid(libc::getuid()) };
+        if ent.is_null() {
+            Ok("/".into())
+        } else {
+            use std::ffi::CStr;
+            use std::str;
+            let home = unsafe { CStr::from_ptr((*ent).pw_dir) };
+            home.to_str().map(str::to_owned).context("failed to resolve home dir")
+        }
+    }
+}
+
+#[async_trait]
+pub trait AsyncMasterPty {
+    async fn read(&mut self, buff: &mut [u8]) -> io::Result<usize>;
+    async fn write(&mut self, buff: &[u8]) -> io::Result<usize>;
+    fn resize(&self, size: PtySize) -> anyhow::Result<()>;
+}
+
+#[async_trait]
+pub trait AsyncMasterPtyExt: AsyncMasterPty {
+    async fn write_all(&mut self, mut buff: &[u8]) -> io::Result<()> {
+        while !buff.is_empty() {
+            match self.write(buff).await {
+                Ok(0) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "failed to write whole buffer",
+                    ));
+                },
+                Ok(n) => buff = &buff[n..],
+                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {},
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<T: AsyncMasterPty + ?Sized> AsyncMasterPtyExt for T {}
+
+pub trait MasterPty {
+    fn get_async_master_pty(self: Box<Self>) -> anyhow::Result<Box<dyn AsyncMasterPty + Send + Sync>>;
+}
+
+pub trait SlavePty {
+    fn spawn_command(&self, builder: CommandBuilder) -> anyhow::Result<Box<dyn Child + Send + Sync>>;
+    fn get_name(&self) -> Option<String>;
+}
+
+pub struct PtyPair {
+    // slave is listed first so that it is dropped first.
+    // The drop order is stable and specified by rust rfc 1857
+    pub slave: Box<dyn SlavePty + Send>,
+    pub master: Box<dyn MasterPty + Send>,
+}
+
 
 #[cfg(test)]
 mod tests {

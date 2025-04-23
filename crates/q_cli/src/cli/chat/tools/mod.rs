@@ -72,7 +72,7 @@ impl Tool {
         match self {
             Tool::FsRead(fs_read) => fs_read.invoke(context, updates).await,
             Tool::FsWrite(fs_write) => fs_write.invoke(context, updates).await,
-            Tool::ExecuteBash(execute_bash) => execute_bash.invoke(updates).await,
+            Tool::ExecuteBash(execute_bash) => execute_bash.invoke3(updates).await.map_err(|e| eyre::eyre!(e)),
             Tool::UseAws(use_aws) => use_aws.invoke(context, updates).await,
             Tool::GhIssue(gh_issue) => gh_issue.invoke(updates).await,
         }

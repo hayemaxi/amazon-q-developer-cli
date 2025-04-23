@@ -25,12 +25,16 @@ use std::process::{
     Command as ProcessCommand,
     ExitCode,
 };
+use std::sync::mpsc::{self, TryRecvError};
 use std::sync::Arc;
 use std::time::Duration;
 use std::{
     env,
     fs,
 };
+use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+use nix::sys::signal::{self, Signal};
+use nix::unistd::Pid;
 
 use command::{
     Command,
@@ -524,6 +528,189 @@ impl<W> ChatContext<W>
 where
     W: Write,
 {
+    /// Execute a command in an interactive PTY that respects the user's shell environment
+    fn execute_interactive_command(&mut self, command: &str) -> Result<(), ChatError> {
+        // Get the user's preferred shell
+        let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
+        
+        // Create a new pty system
+        let pty_system = native_pty_system();
+        
+        // Create a command to run in the pty
+        let mut cmd = CommandBuilder::new(&shell);
+        
+        // Add the command to execute
+        cmd.arg("-lci");
+        cmd.arg(command);
+        
+        // Set the current working directory to the current directory
+        if let Ok(cwd) = env::current_dir() {
+            cmd.cwd(cwd);
+        }
+        
+        // Copy environment variables
+        for (key, value) in env::vars() {
+            cmd.env(key, value);
+        }
+        
+        // Get the current terminal size
+        let term_size = terminal::size().unwrap_or((80, 24));
+        let pty_size = PtySize {
+            rows: term_size.1,
+            cols: term_size.0,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+        
+        // Create a new pty pair with the specified size
+        let pair = pty_system.openpty(pty_size).map_err(|e| ChatError::Custom(format!("Failed to open pty: {}", e).into()))?;
+        
+        // Spawn the command in the pty
+        let mut child = pair.slave.spawn_command(cmd).map_err(|e| ChatError::Custom(format!("Failed to spawn command: {}", e).into()))?;
+        
+        // Get handles to the pty master
+        let mut reader = pair.master.try_clone_reader().map_err(|e| ChatError::Custom(format!("Failed to clone reader: {}", e).into()))?;
+        let writer = pair.master.take_writer().map_err(|e| ChatError::Custom(format!("Failed to take writer: {}", e).into()))?;
+        
+        // Save cursor position and terminal state
+        let mut stdout = std::io::stdout();
+        execute!(stdout, cursor::SavePosition)?;
+        
+        // Put the terminal in raw mode to pass through all keypresses
+        let _prev_terminal_state = crossterm::terminal::enable_raw_mode().map_err(|e| ChatError::Custom(format!("Failed to enable raw mode: {}", e).into()))?;
+        
+        let (tx1, rx1) = std::sync::mpsc::channel();
+        let (tx2, rx2) = std::sync::mpsc::channel();
+
+        // Create a thread to read from stdin and write to the pty
+        let stdin_thread = std::thread::spawn(move || {
+            let mut stdin = std::io::stdin();
+            let mut buffer = [0; 1024];
+            let mut writer = writer;
+    
+            loop {
+                // Check if we should exit
+                match rx1.try_recv() {
+                    Ok(_) | Err(TryRecvError::Disconnected) => {
+                        execute!(
+                            std::io::stdout(),
+                            style::Print("exit signals received tx1\n"),
+                        );
+                        break
+                    },
+                    Err(TryRecvError::Empty) => {},
+                }
+                execute!(
+                    std::io::stdout(),
+                    style::Print("waiting for input\n"),
+                );
+                // Use a timeout for reading from stdin
+                if crossterm::event::poll(Duration::from_millis(100)).unwrap_or(false) {
+                    match stdin.read(&mut buffer) {
+                        Ok(0) => {
+                            execute!(
+                                std::io::stdout(),
+                                style::Print("broke out Ok(0)\n"),
+                            );
+                            break
+                        }, // EOF
+                        Ok(n) => {
+                            let rs = writer.write_all(&buffer[..n]);
+                            if rs.is_err() {
+                                execute!(
+                                    std::io::stdout(),
+                                    style::Print(format!("broke out write error: {:?}\n", rs.err().unwrap())),
+                                );
+                                break;
+                            }
+                            if writer.flush().is_err() {
+                                execute!(
+                                    std::io::stdout(),
+                                    style::Print("broke out flush error\n"),
+                                );
+                                break;
+                            }
+                        },
+                        Err(_) => {
+                            execute!(
+                                std::io::stdout(),
+                                style::Print("broke out generic error\n"),
+                            );
+                            break
+                        },
+                    }
+                }
+            }
+        });
+        
+        // Read from the pty and write to stdout
+        let mut buffer = [0; 1024];
+        
+        // Spawn a thread to wait for the child process to exit
+        let child_pid = child.process_id().unwrap_or(0);
+        let wait_thread = std::thread::spawn(move || {
+            let exit_status = child.wait();
+            tx1.send(()).ok();
+            tx2.send(()).ok();
+            drop(tx1);
+            drop(tx2);
+            execute!(
+                std::io::stdout(),
+                style::Print("exit signals sent\n"),
+            )?;
+            exit_status
+        });
+        
+        // Read from the pty and write to stdout until the child process exits
+        loop {
+            // Check if the child process has exited
+            if rx2.try_recv().is_ok() {
+                break;
+            }
+            
+            // Read from the pty
+            match reader.read(&mut buffer) {
+                Ok(0) => break, // EOF
+                Ok(n) => {
+                    if stdout.write_all(&buffer[..n]).is_err() {
+                        break;
+                    }
+                    if stdout.flush().is_err() {
+                        break;
+                    }
+                },
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    // No data available, try again
+                    std::thread::sleep(Duration::from_millis(10));
+                },
+                Err(_) => break,
+            }
+        }
+
+        // Wait for the child process to exit and get its status
+        let _ = wait_thread.join();
+
+        let _ = stdin_thread.join();
+        
+        // Restore the terminal state
+        let _ = crossterm::terminal::disable_raw_mode();
+        
+        // Clear any pending input that might cause the need to press Enter
+        while crossterm::event::poll(Duration::from_millis(2)).unwrap_or(false) {
+            let _ = crossterm::event::read();
+        }
+        
+        // Restore cursor position
+        execute!(
+            stdout,
+            terminal::Clear(terminal::ClearType::FromCursorDown),
+            cursor::Show,
+            style::ResetColor,
+        )?;
+        
+        Ok(())
+    }
+
     /// Opens the user's preferred editor to compose a prompt
     fn open_editor(initial_text: Option<String>) -> Result<String, ChatError> {
         // Create a temporary file with a unique name
@@ -1071,7 +1258,8 @@ where
                 queue!(self.output, style::Print('\n'))?;
                 // std::process::Command::new("bash").args(["-c", &command]).status().ok();
                 // ExecuteShellCommand::invoke(&command, &mut self.output).await.ok();
-                ExecuteShellCommand::invoke2(&command).await.ok();
+                // ExecuteShellCommand::invoke2(&command).await.ok();
+                self.execute_interactive_command(&command)?;
                 queue!(self.output, style::Print('\n'))?;
                 ChatState::PromptUser {
                     tool_uses: None,
