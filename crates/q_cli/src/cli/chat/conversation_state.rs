@@ -415,7 +415,8 @@ impl ConversationState {
         if let Some(user_input_context) = user_input_context {
             input_message.content = format!("{} {}", user_input_context, input_message.content);
         }
-
+        println!("history: {:?}", curr_state.history);
+        println!("Sending message: {}", input_message.content);
         FigConversationState {
             conversation_id: Some(curr_state.conversation_id),
             user_input_message: input_message,

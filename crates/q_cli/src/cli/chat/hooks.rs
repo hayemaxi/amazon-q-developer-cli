@@ -33,7 +33,7 @@ use spinners::{
     Spinners,
 };
 
-use super::tools::execute_bash::run_command;
+use super::tools::execute_bash::ExecuteBash;
 
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_MAX_OUTPUT_SIZE: usize = 1024 * 10;
@@ -292,15 +292,18 @@ impl HookExecutor {
 
     async fn execute_inline_hook(&self, hook: &Hook) -> Result<String> {
         let command = hook.command.as_ref().ok_or_else(|| eyre!("no command specified"))?;
+        let execute_bash = ExecuteBash {
+            command: command.clone(),
+        };
 
-        let command_future = run_command(command, hook.max_output_size, None::<std::io::Stdout>);
+        let command_future = execute_bash.execute_pty_without_input(hook.max_output_size, false);
         let timeout = Duration::from_millis(hook.timeout_ms);
 
         // Run with timeout
         match tokio::time::timeout(timeout, command_future).await {
             Ok(result) => {
                 let result = result?;
-                match result.exit_status.unwrap_or(0) {
+                match result.exit_status {
                     0 => Ok(result.stdout),
                     code => Err(eyre!("command returned non-zero exit code: {}", code)),
                 }
