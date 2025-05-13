@@ -298,6 +298,7 @@ pub async fn launch_chat(database: &mut Database, telemetry: &TelemetryThread, a
         telemetry,
         args.input,
         args.no_interactive,
+        args.new,
         args.accept_all,
         args.profile,
         args.trust_all_tools,
@@ -306,12 +307,13 @@ pub async fn launch_chat(database: &mut Database, telemetry: &TelemetryThread, a
     .await
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
 pub async fn chat(
     database: &mut Database,
     telemetry: &TelemetryThread,
     input: Option<String>,
     no_interactive: bool,
+    new_conversation: bool,
     accept_all: bool,
     profile: Option<String>,
     trust_all_tools: bool,
@@ -440,6 +442,7 @@ pub async fn chat(
         input,
         InputSource::new(database, prompt_request_sender, prompt_response_receiver)?,
         interactive,
+        new_conversation,
         client,
         || terminal::window_size().map(|s| s.columns.into()).ok(),
         tool_manager,
@@ -526,6 +529,7 @@ impl ChatContext {
         mut input: Option<String>,
         input_source: InputSource,
         interactive: bool,
+        new_conversation: bool,
         client: StreamingClient,
         terminal_width_provider: fn() -> Option<usize>,
         tool_manager: ToolManager,
@@ -537,21 +541,38 @@ impl ChatContext {
         let output_clone = output.clone();
 
         let mut existing_conversation = false;
-        let conversation_state = match std::env::current_dir()
-            .ok()
-            .and_then(|cwd| database.get_conversation_by_path(cwd).ok())
-            .flatten()
-        {
-            Some(mut prior) => {
+        let conversation_state = if new_conversation {
+            let new_state = ConversationState::new(
+                ctx_clone,
+                conversation_id,
+                tool_config,
+                profile,
+                Some(output_clone),
+                tool_manager,
+            )
+            .await;
+
+            std::env::current_dir()
+                .ok()
+                .and_then(|cwd| database.set_conversation_by_path(cwd, &new_state).ok());
+            new_state
+        } else {
+            let prior = std::env::current_dir()
+                .ok()
+                .and_then(|cwd| database.get_conversation_by_path(cwd).ok())
+                .flatten();
+
+            // Only restore conversations where there were actual messages.
+            // Prevents edge case where user clears conversation with --new, then exits without chatting.
+            if prior.as_ref().is_some_and(|cs| !cs.history().is_empty()) {
+                let mut cs = prior.unwrap();
+
                 existing_conversation = true;
-                prior
-                    .reload_serialized_state(Arc::clone(&ctx), Some(output.clone()))
-                    .await;
+                cs.reload_serialized_state(Arc::clone(&ctx), Some(output.clone())).await;
                 input = Some(input.unwrap_or("In a few words, summarize our conversation so far.".to_owned()));
-                prior.tool_manager = tool_manager;
-                prior
-            },
-            None => {
+                cs.tool_manager = tool_manager;
+                cs
+            } else {
                 ConversationState::new(
                     ctx_clone,
                     conversation_id,
@@ -561,7 +582,7 @@ impl ChatContext {
                     tool_manager,
                 )
                 .await
-            },
+            }
         };
 
         Ok(Self {
@@ -3692,6 +3713,7 @@ mod tests {
                 "exit".to_string(),
             ]),
             true,
+            false,
             test_client,
             || Some(80),
             tool_manager,
@@ -3837,6 +3859,7 @@ mod tests {
                 "exit".to_string(),
             ]),
             true,
+            false,
             test_client,
             || Some(80),
             tool_manager,
@@ -3935,6 +3958,7 @@ mod tests {
                 "exit".to_string(),
             ]),
             true,
+            false,
             test_client,
             || Some(80),
             tool_manager,
@@ -4012,6 +4036,7 @@ mod tests {
                 "exit".to_string(),
             ]),
             true,
+            false,
             test_client,
             || Some(80),
             tool_manager,

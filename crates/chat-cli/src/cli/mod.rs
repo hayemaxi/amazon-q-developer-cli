@@ -369,6 +369,7 @@ mod test {
             subcommand: Some(CliRootCommands::Chat(Chat {
                 accept_all: false,
                 no_interactive: false,
+                new: false,
                 input: None,
                 profile: None,
                 trust_all_tools: false,
@@ -407,6 +408,7 @@ mod test {
             CliRootCommands::Chat(Chat {
                 accept_all: false,
                 no_interactive: false,
+                new: false,
                 input: None,
                 profile: Some("my-profile".to_string()),
                 trust_all_tools: false,
@@ -422,6 +424,7 @@ mod test {
             CliRootCommands::Chat(Chat {
                 accept_all: false,
                 no_interactive: false,
+                new: false,
                 input: Some("Hello".to_string()),
                 profile: Some("my-profile".to_string()),
                 trust_all_tools: false,
@@ -437,6 +440,7 @@ mod test {
             CliRootCommands::Chat(Chat {
                 accept_all: true,
                 no_interactive: false,
+                new: false,
                 input: None,
                 profile: Some("my-profile".to_string()),
                 trust_all_tools: false,
@@ -446,12 +450,13 @@ mod test {
     }
 
     #[test]
-    fn test_chat_with_no_interactive() {
+    fn test_chat_with_no_interactive_new() {
         assert_parse!(
-            ["chat", "--no-interactive"],
+            ["chat", "--no-interactive", "--new"],
             CliRootCommands::Chat(Chat {
                 accept_all: false,
                 no_interactive: true,
+                new: true,
                 input: None,
                 profile: None,
                 trust_all_tools: false,
@@ -467,6 +472,7 @@ mod test {
             CliRootCommands::Chat(Chat {
                 accept_all: false,
                 no_interactive: false,
+                new: false,
                 input: None,
                 profile: None,
                 trust_all_tools: true,
@@ -482,6 +488,7 @@ mod test {
             CliRootCommands::Chat(Chat {
                 accept_all: false,
                 no_interactive: false,
+                new: false,
                 input: None,
                 profile: None,
                 trust_all_tools: false,
@@ -497,6 +504,7 @@ mod test {
             CliRootCommands::Chat(Chat {
                 accept_all: false,
                 no_interactive: false,
+                new: false,
                 input: None,
                 profile: None,
                 trust_all_tools: false,
