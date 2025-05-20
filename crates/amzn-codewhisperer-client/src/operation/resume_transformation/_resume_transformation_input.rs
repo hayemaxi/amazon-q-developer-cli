@@ -30,6 +30,7 @@ impl ResumeTransformationInput {
 impl ResumeTransformationInput {
     /// Creates a new builder-style object to manufacture
     /// [`ResumeTransformationInput`](crate::operation::resume_transformation::ResumeTransformationInput).
+    ///
     pub fn builder() -> crate::operation::resume_transformation::builders::ResumeTransformationInputBuilder {
         crate::operation::resume_transformation::builders::ResumeTransformationInputBuilder::default()
     }
@@ -37,6 +38,7 @@ impl ResumeTransformationInput {
 
 /// A builder for
 /// [`ResumeTransformationInput`](crate::operation::resume_transformation::ResumeTransformationInput).
+///
 #[derive(::std::clone::Clone, ::std::cmp::PartialEq, ::std::default::Default, ::std::fmt::Debug)]
 #[non_exhaustive]
 pub struct ResumeTransformationInputBuilder {
@@ -102,6 +104,7 @@ impl ResumeTransformationInputBuilder {
 
     /// Consumes the builder and constructs a
     /// [`ResumeTransformationInput`](crate::operation::resume_transformation::ResumeTransformationInput).
+    ///
     pub fn build(
         self,
     ) -> ::std::result::Result<

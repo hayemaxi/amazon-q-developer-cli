@@ -97,6 +97,7 @@ impl TelemetryEvent {
 
     /// Returns true if this is a
     /// [`ChatInteractWithMessageEvent`](crate::types::TelemetryEvent::ChatInteractWithMessageEvent).
+    ///
     pub fn is_chat_interact_with_message_event(&self) -> bool {
         self.as_chat_interact_with_message_event().is_ok()
     }
@@ -319,6 +320,7 @@ impl TelemetryEvent {
 
     /// Returns true if this is a
     /// [`FeatureDevCodeAcceptanceEvent`](crate::types::TelemetryEvent::FeatureDevCodeAcceptanceEvent).
+    ///
     pub fn is_feature_dev_code_acceptance_event(&self) -> bool {
         self.as_feature_dev_code_acceptance_event().is_ok()
     }
@@ -340,6 +342,7 @@ impl TelemetryEvent {
 
     /// Returns true if this is a
     /// [`FeatureDevCodeGenerationEvent`](crate::types::TelemetryEvent::FeatureDevCodeGenerationEvent).
+    ///
     pub fn is_feature_dev_code_generation_event(&self) -> bool {
         self.as_feature_dev_code_generation_event().is_ok()
     }
@@ -413,6 +416,7 @@ impl TelemetryEvent {
 
     /// Returns true if this is a
     /// [`TerminalUserInteractionEvent`](crate::types::TelemetryEvent::TerminalUserInteractionEvent).
+    ///
     pub fn is_terminal_user_interaction_event(&self) -> bool {
         self.as_terminal_user_interaction_event().is_ok()
     }

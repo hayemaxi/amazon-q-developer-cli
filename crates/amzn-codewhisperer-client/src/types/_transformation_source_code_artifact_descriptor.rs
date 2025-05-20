@@ -24,6 +24,7 @@ impl TransformationSourceCodeArtifactDescriptor {
 impl TransformationSourceCodeArtifactDescriptor {
     /// Creates a new builder-style object to manufacture
     /// [`TransformationSourceCodeArtifactDescriptor`](crate::types::TransformationSourceCodeArtifactDescriptor).
+    ///
     pub fn builder() -> crate::types::builders::TransformationSourceCodeArtifactDescriptorBuilder {
         crate::types::builders::TransformationSourceCodeArtifactDescriptorBuilder::default()
     }
@@ -31,6 +32,7 @@ impl TransformationSourceCodeArtifactDescriptor {
 
 /// A builder for
 /// [`TransformationSourceCodeArtifactDescriptor`](crate::types::TransformationSourceCodeArtifactDescriptor).
+///
 #[derive(::std::clone::Clone, ::std::cmp::PartialEq, ::std::default::Default, ::std::fmt::Debug)]
 #[non_exhaustive]
 pub struct TransformationSourceCodeArtifactDescriptorBuilder {
@@ -81,6 +83,7 @@ impl TransformationSourceCodeArtifactDescriptorBuilder {
 
     /// Consumes the builder and constructs a
     /// [`TransformationSourceCodeArtifactDescriptor`](crate::types::TransformationSourceCodeArtifactDescriptor).
+    ///
     pub fn build(self) -> crate::types::TransformationSourceCodeArtifactDescriptor {
         crate::types::TransformationSourceCodeArtifactDescriptor {
             languages: self.languages,

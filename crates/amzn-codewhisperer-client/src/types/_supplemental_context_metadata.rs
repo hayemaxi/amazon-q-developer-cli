@@ -35,6 +35,7 @@ impl SupplementalContextMetadata {
 
     /// Returns true if this is a
     /// [`PreviousEditorStateMetadata`](crate::types::SupplementalContextMetadata::PreviousEditorStateMetadata).
+    ///
     pub fn is_previous_editor_state_metadata(&self) -> bool {
         self.as_previous_editor_state_metadata().is_ok()
     }

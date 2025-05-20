@@ -58,6 +58,7 @@ pub enum Command {
         path: String,
         force: bool,
     },
+    Upgrade,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -837,6 +838,7 @@ impl Command {
                     }
                     Self::Save { path, force }
                 },
+                "upgrade" => Self::Upgrade,
                 unknown_command => {
                     let looks_like_path = {
                         let after_slash_command_str = parts[1..].join(" ");

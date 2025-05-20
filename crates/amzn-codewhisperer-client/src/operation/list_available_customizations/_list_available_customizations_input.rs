@@ -29,6 +29,7 @@ impl ListAvailableCustomizationsInput {
 impl ListAvailableCustomizationsInput {
     /// Creates a new builder-style object to manufacture
     /// [`ListAvailableCustomizationsInput`](crate::operation::list_available_customizations::ListAvailableCustomizationsInput).
+    ///
     pub fn builder()
     -> crate::operation::list_available_customizations::builders::ListAvailableCustomizationsInputBuilder {
         crate::operation::list_available_customizations::builders::ListAvailableCustomizationsInputBuilder::default()
@@ -37,6 +38,7 @@ impl ListAvailableCustomizationsInput {
 
 /// A builder for
 /// [`ListAvailableCustomizationsInput`](crate::operation::list_available_customizations::ListAvailableCustomizationsInput).
+///
 #[derive(::std::clone::Clone, ::std::cmp::PartialEq, ::std::default::Default, ::std::fmt::Debug)]
 #[non_exhaustive]
 pub struct ListAvailableCustomizationsInputBuilder {
@@ -98,6 +100,7 @@ impl ListAvailableCustomizationsInputBuilder {
 
     /// Consumes the builder and constructs a
     /// [`ListAvailableCustomizationsInput`](crate::operation::list_available_customizations::ListAvailableCustomizationsInput).
+    ///
     pub fn build(
         self,
     ) -> ::std::result::Result<

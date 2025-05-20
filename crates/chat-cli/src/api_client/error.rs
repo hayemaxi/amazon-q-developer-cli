@@ -1,3 +1,4 @@
+use amzn_codewhisperer_client::operation::create_subscription_token::CreateSubscriptionTokenError;
 use amzn_codewhisperer_client::operation::generate_completions::GenerateCompletionsError;
 use amzn_codewhisperer_client::operation::list_available_customizations::ListAvailableCustomizationsError;
 use amzn_codewhisperer_client::operation::list_available_profiles::ListAvailableProfilesError;
@@ -48,6 +49,9 @@ pub enum ApiClientError {
     // quota breach
     #[error("quota has reached its limit")]
     QuotaBreach(&'static str),
+
+    #[error(transparent)]
+    CreateSubscriptionTokenError(#[from] SdkError<CreateSubscriptionTokenError, HttpResponse>),
 
     /// Returned from the backend when the user input is too large to fit within the model context
     /// window.

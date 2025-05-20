@@ -29,6 +29,7 @@ impl ::aws_types::request_id::RequestId for ListAvailableProfilesOutput {
 impl ListAvailableProfilesOutput {
     /// Creates a new builder-style object to manufacture
     /// [`ListAvailableProfilesOutput`](crate::operation::list_available_profiles::ListAvailableProfilesOutput).
+    ///
     pub fn builder() -> crate::operation::list_available_profiles::builders::ListAvailableProfilesOutputBuilder {
         crate::operation::list_available_profiles::builders::ListAvailableProfilesOutputBuilder::default()
     }
@@ -36,6 +37,7 @@ impl ListAvailableProfilesOutput {
 
 /// A builder for
 /// [`ListAvailableProfilesOutput`](crate::operation::list_available_profiles::ListAvailableProfilesOutput).
+///
 #[derive(::std::clone::Clone, ::std::cmp::PartialEq, ::std::default::Default, ::std::fmt::Debug)]
 #[non_exhaustive]
 pub struct ListAvailableProfilesOutputBuilder {

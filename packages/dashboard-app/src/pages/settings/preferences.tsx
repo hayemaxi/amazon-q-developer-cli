@@ -69,6 +69,12 @@ export default function Page() {
     });
   }
 
+  function upgrade() {
+    User.upgrade().then(() => {
+      window.location.reload();
+    });
+  }
+
   return (
     <>
       <UserPrefView array={settings} />
@@ -162,6 +168,30 @@ export default function Page() {
             </div>
           </div>
         </div>
+        {auth.authed && auth.authKind === "BuilderId" && ( <div className={`flex p-4 pl-0 gap-4`}>
+          <div className="flex flex-col gap-1">
+            <h3 className="font-medium leading-none">Subscription</h3>
+            <p className="font-light leading-tight text-sm">
+              Upgrade to increase monthly usage limits
+            </p>
+            <p className="font-light leading-tight text-sm text-black/50 dark:text-white/50">
+              {auth.tier === "free"
+                ? "Free tier"
+                : "Paid tier"}
+            </p>
+
+            <div className="pt-2">
+              <Button
+                variant="outline"
+                onClick={() => upgrade()}
+                disabled={!auth.authed || !auth.authKind === "BuilderId" || !auth.tier === "free"}
+              >
+                Upgrade
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
       </section>
       <section className={`py-4 gap-4`}>
         <h2

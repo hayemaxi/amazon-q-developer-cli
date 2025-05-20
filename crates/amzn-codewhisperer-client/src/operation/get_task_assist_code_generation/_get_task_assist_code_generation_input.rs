@@ -30,6 +30,7 @@ impl GetTaskAssistCodeGenerationInput {
 impl GetTaskAssistCodeGenerationInput {
     /// Creates a new builder-style object to manufacture
     /// [`GetTaskAssistCodeGenerationInput`](crate::operation::get_task_assist_code_generation::GetTaskAssistCodeGenerationInput).
+    ///
     pub fn builder()
     -> crate::operation::get_task_assist_code_generation::builders::GetTaskAssistCodeGenerationInputBuilder {
         crate::operation::get_task_assist_code_generation::builders::GetTaskAssistCodeGenerationInputBuilder::default()
@@ -38,6 +39,7 @@ impl GetTaskAssistCodeGenerationInput {
 
 /// A builder for
 /// [`GetTaskAssistCodeGenerationInput`](crate::operation::get_task_assist_code_generation::GetTaskAssistCodeGenerationInput).
+///
 #[derive(::std::clone::Clone, ::std::cmp::PartialEq, ::std::default::Default, ::std::fmt::Debug)]
 #[non_exhaustive]
 pub struct GetTaskAssistCodeGenerationInputBuilder {
@@ -101,6 +103,7 @@ impl GetTaskAssistCodeGenerationInputBuilder {
 
     /// Consumes the builder and constructs a
     /// [`GetTaskAssistCodeGenerationInput`](crate::operation::get_task_assist_code_generation::GetTaskAssistCodeGenerationInput).
+    ///
     pub fn build(
         self,
     ) -> ::std::result::Result<

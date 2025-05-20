@@ -3,6 +3,7 @@ use std::sync::{
     Mutex,
 };
 
+use amzn_codewhisperer_streaming_client::types::error::ThrottlingError;
 use amzn_codewhisperer_streaming_client::Client as CodewhispererStreamingClient;
 use amzn_qdeveloper_streaming_client::Client as QDeveloperStreamingClient;
 use aws_types::request_id::RequestId;
@@ -130,12 +131,14 @@ impl StreamingClient {
         &self,
         conversation_state: ConversationState,
     ) -> Result<SendMessageOutput, ApiClientError> {
+        // return Err(ApiClientError::QuotaBreach("quota has reached its limit"));
         debug!("Sending conversation: {:#?}", conversation_state);
         let ConversationState {
             conversation_id,
             user_input_message,
             history,
         } = conversation_state;
+        return Err(ApiClientError::QuotaBreach("quota has reached its limit"));
 
         match &self.inner {
             inner::Inner::Codewhisperer(client) => {
@@ -161,10 +164,15 @@ impl StreamingClient {
                     .send()
                     .await;
 
-                match response {
+                    match response {
                     Ok(resp) => Ok(SendMessageOutput::Codewhisperer(resp)),
                     Err(e) => {
-                        let is_quota_breach = e.raw_response().is_some_and(|resp| resp.status().as_u16() == 429);
+                        let x = e.raw_response().unwrap();
+                        let x2 = e.as_service_error().unwrap().to_string();
+                        let is_quota_breach = e.raw_response().is_some_and(|resp| resp.status().as_u16() == 429 || e.as_service_error().is_some_and(|e| { match e {
+                            crate::api_client::error::GenerateAssistantResponseError::ThrottlingError(e) => e.message.contains("reached for this month"),
+                            _ => false,
+                        }}));
                         let is_context_window_overflow = e.as_service_error().is_some_and(|err| {
                             matches!(err, err if err.meta().code() == Some("ValidationException")
                                 && err.meta().message() == Some("Input is too long."))

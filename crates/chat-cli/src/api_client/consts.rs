@@ -13,3 +13,8 @@ pub const PROD_CODEWHISPERER_FRA_ENDPOINT_REGION: Region = Region::from_static("
 
 // Opt out constants
 pub const X_AMZN_CODEWHISPERER_OPT_OUT_HEADER: &str = "x-amzn-codewhisperer-optout";
+
+
+// Dummy value to provide subscription status (for the holder of a given bearer token?)
+// This is a service-side implementation and intentional.
+pub const SUBSCRIPTION_STATUS_ACCOUNT_ID: &str = "111111111111";

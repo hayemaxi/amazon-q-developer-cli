@@ -22,6 +22,7 @@ impl ::aws_types::request_id::RequestId for StartTestGenerationOutput {
 impl StartTestGenerationOutput {
     /// Creates a new builder-style object to manufacture
     /// [`StartTestGenerationOutput`](crate::operation::start_test_generation::StartTestGenerationOutput).
+    ///
     pub fn builder() -> crate::operation::start_test_generation::builders::StartTestGenerationOutputBuilder {
         crate::operation::start_test_generation::builders::StartTestGenerationOutputBuilder::default()
     }
@@ -29,6 +30,7 @@ impl StartTestGenerationOutput {
 
 /// A builder for
 /// [`StartTestGenerationOutput`](crate::operation::start_test_generation::StartTestGenerationOutput).
+///
 #[derive(::std::clone::Clone, ::std::cmp::PartialEq, ::std::default::Default, ::std::fmt::Debug)]
 #[non_exhaustive]
 pub struct StartTestGenerationOutputBuilder {
@@ -65,6 +67,7 @@ impl StartTestGenerationOutputBuilder {
 
     /// Consumes the builder and constructs a
     /// [`StartTestGenerationOutput`](crate::operation::start_test_generation::StartTestGenerationOutput).
+    ///
     pub fn build(self) -> crate::operation::start_test_generation::StartTestGenerationOutput {
         crate::operation::start_test_generation::StartTestGenerationOutput {
             test_generation_job: self.test_generation_job,

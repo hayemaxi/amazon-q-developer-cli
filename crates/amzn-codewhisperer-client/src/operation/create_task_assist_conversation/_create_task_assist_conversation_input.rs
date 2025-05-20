@@ -16,6 +16,7 @@ impl CreateTaskAssistConversationInput {
 impl CreateTaskAssistConversationInput {
     /// Creates a new builder-style object to manufacture
     /// [`CreateTaskAssistConversationInput`](crate::operation::create_task_assist_conversation::CreateTaskAssistConversationInput).
+    ///
     pub fn builder()
     -> crate::operation::create_task_assist_conversation::builders::CreateTaskAssistConversationInputBuilder {
         crate::operation::create_task_assist_conversation::builders::CreateTaskAssistConversationInputBuilder::default()
@@ -24,6 +25,7 @@ impl CreateTaskAssistConversationInput {
 
 /// A builder for
 /// [`CreateTaskAssistConversationInput`](crate::operation::create_task_assist_conversation::CreateTaskAssistConversationInput).
+///
 #[derive(::std::clone::Clone, ::std::cmp::PartialEq, ::std::default::Default, ::std::fmt::Debug)]
 #[non_exhaustive]
 pub struct CreateTaskAssistConversationInputBuilder {
@@ -49,6 +51,7 @@ impl CreateTaskAssistConversationInputBuilder {
 
     /// Consumes the builder and constructs a
     /// [`CreateTaskAssistConversationInput`](crate::operation::create_task_assist_conversation::CreateTaskAssistConversationInput).
+    ///
     pub fn build(
         self,
     ) -> ::std::result::Result<

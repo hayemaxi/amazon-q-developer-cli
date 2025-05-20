@@ -46,6 +46,7 @@ impl ::std::fmt::Debug for ListWorkspaceMetadataInput {
 impl ListWorkspaceMetadataInput {
     /// Creates a new builder-style object to manufacture
     /// [`ListWorkspaceMetadataInput`](crate::operation::list_workspace_metadata::ListWorkspaceMetadataInput).
+    ///
     pub fn builder() -> crate::operation::list_workspace_metadata::builders::ListWorkspaceMetadataInputBuilder {
         crate::operation::list_workspace_metadata::builders::ListWorkspaceMetadataInputBuilder::default()
     }
@@ -53,6 +54,7 @@ impl ListWorkspaceMetadataInput {
 
 /// A builder for
 /// [`ListWorkspaceMetadataInput`](crate::operation::list_workspace_metadata::ListWorkspaceMetadataInput).
+///
 #[derive(::std::clone::Clone, ::std::cmp::PartialEq, ::std::default::Default)]
 #[non_exhaustive]
 pub struct ListWorkspaceMetadataInputBuilder {
@@ -132,6 +134,7 @@ impl ListWorkspaceMetadataInputBuilder {
 
     /// Consumes the builder and constructs a
     /// [`ListWorkspaceMetadataInput`](crate::operation::list_workspace_metadata::ListWorkspaceMetadataInput).
+    ///
     pub fn build(
         self,
     ) -> ::std::result::Result<

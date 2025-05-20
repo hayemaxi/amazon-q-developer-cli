@@ -80,6 +80,7 @@ impl UploadContext {
 
     /// Returns true if this is a
     /// [`TaskAssistPlanningUploadContext`](crate::types::UploadContext::TaskAssistPlanningUploadContext).
+    ///
     pub fn is_task_assist_planning_upload_context(&self) -> bool {
         self.as_task_assist_planning_upload_context().is_ok()
     }
@@ -122,6 +123,7 @@ impl UploadContext {
 
     /// Returns true if this is a
     /// [`WorkspaceContextUploadContext`](crate::types::UploadContext::WorkspaceContextUploadContext).
+    ///
     pub fn is_workspace_context_upload_context(&self) -> bool {
         self.as_workspace_context_upload_context().is_ok()
     }

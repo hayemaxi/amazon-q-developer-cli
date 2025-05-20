@@ -23,6 +23,7 @@ impl ::aws_types::request_id::RequestId for StartTransformationOutput {
 impl StartTransformationOutput {
     /// Creates a new builder-style object to manufacture
     /// [`StartTransformationOutput`](crate::operation::start_transformation::StartTransformationOutput).
+    ///
     pub fn builder() -> crate::operation::start_transformation::builders::StartTransformationOutputBuilder {
         crate::operation::start_transformation::builders::StartTransformationOutputBuilder::default()
     }
@@ -30,6 +31,7 @@ impl StartTransformationOutput {
 
 /// A builder for
 /// [`StartTransformationOutput`](crate::operation::start_transformation::StartTransformationOutput).
+///
 #[derive(::std::clone::Clone, ::std::cmp::PartialEq, ::std::default::Default, ::std::fmt::Debug)]
 #[non_exhaustive]
 pub struct StartTransformationOutputBuilder {

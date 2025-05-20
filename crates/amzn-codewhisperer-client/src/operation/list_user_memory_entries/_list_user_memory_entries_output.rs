@@ -29,6 +29,7 @@ impl ::aws_types::request_id::RequestId for ListUserMemoryEntriesOutput {
 impl ListUserMemoryEntriesOutput {
     /// Creates a new builder-style object to manufacture
     /// [`ListUserMemoryEntriesOutput`](crate::operation::list_user_memory_entries::ListUserMemoryEntriesOutput).
+    ///
     pub fn builder() -> crate::operation::list_user_memory_entries::builders::ListUserMemoryEntriesOutputBuilder {
         crate::operation::list_user_memory_entries::builders::ListUserMemoryEntriesOutputBuilder::default()
     }
@@ -36,6 +37,7 @@ impl ListUserMemoryEntriesOutput {
 
 /// A builder for
 /// [`ListUserMemoryEntriesOutput`](crate::operation::list_user_memory_entries::ListUserMemoryEntriesOutput).
+///
 #[derive(::std::clone::Clone, ::std::cmp::PartialEq, ::std::default::Default, ::std::fmt::Debug)]
 #[non_exhaustive]
 pub struct ListUserMemoryEntriesOutputBuilder {
