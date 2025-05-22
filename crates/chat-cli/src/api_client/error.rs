@@ -50,7 +50,11 @@ pub enum ApiClientError {
     #[error("quota has reached its limit")]
     QuotaBreach(&'static str),
 
-    #[error(transparent)]
+    // Separate from quota breach (what is that, anyway?)
+    #[error("monthly query limit reached")]
+    MonthlyLimitReached,
+
+    #[error("{}", SdkErrorDisplay(.0))]
     CreateSubscriptionTokenError(#[from] SdkError<CreateSubscriptionTokenError, HttpResponse>),
 
     /// Returned from the backend when the user input is too large to fit within the model context

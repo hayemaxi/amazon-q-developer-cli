@@ -138,7 +138,6 @@ impl StreamingClient {
             user_input_message,
             history,
         } = conversation_state;
-        return Err(ApiClientError::QuotaBreach("quota has reached its limit"));
 
         match &self.inner {
             inner::Inner::Codewhisperer(client) => {
@@ -167,25 +166,31 @@ impl StreamingClient {
                     match response {
                     Ok(resp) => Ok(SendMessageOutput::Codewhisperer(resp)),
                     Err(e) => {
-                        let x = e.raw_response().unwrap();
-                        let x2 = e.as_service_error().unwrap().to_string();
-                        let is_quota_breach = e.raw_response().is_some_and(|resp| resp.status().as_u16() == 429 || e.as_service_error().is_some_and(|e| { match e {
-                            crate::api_client::error::GenerateAssistantResponseError::ThrottlingError(e) => e.message.contains("reached for this month"),
-                            _ => false,
-                        }}));
+                        let is_quota_breach = e.raw_response().is_some_and(|resp| resp.status().as_u16() == 429);
                         let is_context_window_overflow = e.as_service_error().is_some_and(|err| {
                             matches!(err, err if err.meta().code() == Some("ValidationException")
                                 && err.meta().message() == Some("Input is too long."))
                         });
 
+                        let is_monthly_limit_err = e.raw_response()
+                            .and_then(|resp| resp.body().bytes())
+                            .and_then(|bytes| match String::from_utf8(bytes.to_vec()) {
+                                Ok(s) => Some(s.contains("MONTHLY_REQUEST_COUNT")),
+                                Err(_) => None
+                            })
+                            .unwrap_or(false);
+                    
+
                         if is_quota_breach {
                             Err(ApiClientError::QuotaBreach("quota has reached its limit"))
                         } else if is_context_window_overflow {
                             Err(ApiClientError::ContextWindowOverflow)
+                        } else if is_monthly_limit_err {
+                            Err(ApiClientError::MonthlyLimitReached)
                         } else {
                             Err(e.into())
                         }
-                    },
+                    }
                 }
             },
             inner::Inner::QDeveloper(client) => {

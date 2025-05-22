@@ -270,6 +270,7 @@ const HELP_TEXT: &str = color_print::cstr! {"
 <em>/usage</em>        <black!>Show current session's context window usage</black!>
 <em>/load</em>         <black!>Load conversation state from a JSON file</black!>
 <em>/save</em>         <black!>Save conversation state to a JSON file</black!>
+<em>/upgrade</em>      <black!>Upgrade to a Q Developer Pro subscription for increased query limits</black!>
 
 <cyan,em>MCP:</cyan,em>
 <black!>You can now configure the Amazon Q CLI to use MCP servers. \nLearn how: https://docs.aws.amazon.com/en_us/amazonq/latest/qdeveloper-ug/command-line-mcp.html</black!>
@@ -286,6 +287,14 @@ const RESPONSE_TIMEOUT_CONTENT: &str = "Response timed out - message took too lo
 const TRUST_ALL_TEXT: &str = color_print::cstr! {"<green!>All tools are now trusted (<red!>!</red!>). Amazon Q will execute tools <bold>without</bold> asking for confirmation.\
 \nAgents can sometimes do unexpected things so understand the risks.</green!>
 \nLearn more at https://docs.aws.amazon.com/amazonq/latest/qdeveloper-ug/command-line-chat-security.html#command-line-chat-trustall-safety"};
+
+const UPGRADE_PRO_TEXT: &str = color_print::cstr! {"<white!><bold>Upgrade to Q Developer Pro Subscription - $19/month</bold></white!>
+
+<white!>1. Provide your AWS Account ID number below. (Details about where to find this?)</white!>
+<white!>2. Confirm your subscription in your AWS account. Upon confirmation, your account will begin to be charged.</white!>
+<white!>1. Provide your AWS Account ID number below. (Details about where to find this?)</white!>
+<white!>1. Provide your AWS Account ID number below. (Details about where to find this?)</white!>"};
+
 
 const TOOL_BULLET: &str = " ● ";
 const CONTINUATION_LINE: &str = " ⋮ ";
@@ -1001,30 +1010,39 @@ impl ChatContext {
                             });
                         },
                         crate::api_client::ApiClientError::QuotaBreach(msg) => {
-                            if let Ok(pro_tier) = is_pro_tier(database).await {
-                                if pro_tier {
-                                    execute!(
-                                        self.output,
-                                        style::SetForegroundColor(Color::Yellow),
-                                        style::Print("You have reached your query limit for this month. Your limits will reset next month.\n\n"),
-                                    )?;
-                                } else {
-                                    execute!(
-                                        self.output,
-                                        style::SetForegroundColor(Color::Yellow),
-                                        style::Print("You have reached your query limit for this month. Your limits will reset next month, or you can upgrade to a Pro subscription for additional limits for $19/month."),
-                                        style::SetForegroundColor(Color::DarkGrey),
-                                        style::Print("\n\nUse "),
-                                        style::SetForegroundColor(Color::Green),
-                                        style::Print("/upgrade"),
-                                        style::SetForegroundColor(Color::DarkGrey),
-                                        style::Print(" to upgrade your subscription.\n\n"),
-                                        style::SetForegroundColor(Color::Reset),
-                                        cursor::Show
-                                    )?;
-                                }
+                            print_err!(msg, err);
+                        },
+                        crate::api_client::ApiClientError::MonthlyLimitReached => {
+                            let response = is_pro_tier(database).await;
+                            if response.is_err() {
+                                execute!(
+                                    self.output,
+                                    style::SetForegroundColor(Color::Red),
+                                    style::Print(format!("{}\n\n", response.as_ref().err().unwrap())),
+                                    style::SetForegroundColor(Color::Reset),
+                                )?;
+                                // print_default_error!(err.to_string());
+                            }
+                            if response.is_err() || response.is_ok_and(|is_pro| !is_pro) {
+                                execute!(
+                                    self.output,
+                                    style::SetForegroundColor(Color::Yellow),
+                                    style::Print("You have reached your query limit for this month. Your limits will reset next month, or you can upgrade to a Pro subscription for additional limits for $19/month."),
+                                    style::SetForegroundColor(Color::DarkGrey),
+                                    style::Print("\n\nUse "),
+                                    style::SetForegroundColor(Color::Green),
+                                    style::Print("/upgrade"),
+                                    style::SetForegroundColor(Color::DarkGrey),
+                                    style::Print(" to upgrade your subscription.\n\n"),
+                                    style::SetForegroundColor(Color::Reset),
+                                )?;
                             } else {
-                                print_default_error!(err);
+                                execute!(
+                                    self.output,
+                                    style::SetForegroundColor(Color::Yellow),
+                                    style::Print("You have reached your query limit for this month. Your limits will reset next month.\n\n"),
+                                    style::SetForegroundColor(Color::Reset),
+                                )?;
                             }
                         },
                         _ => {
@@ -2949,8 +2967,8 @@ impl ChatContext {
                     skip_printing_tools: true,
                 }
             },
-            Command::Upgrade => {
-                self.upgrade_to_pro(database).await?;
+            Command::Upgrade { force } => {
+                self.upgrade_to_pro(database, force).await?;
 
                 return Ok(ChatState::PromptUser {
                     tool_uses: Some(tool_uses),
@@ -3499,6 +3517,7 @@ impl ChatContext {
     async fn upgrade_to_pro(
         &mut self,
         database: &mut Database,
+        force: bool,
     ) -> Result<(), ChatError> {
         queue!(
             self.output,
@@ -3506,25 +3525,37 @@ impl ChatContext {
         )?;
 
         // Get current subscription status
-        let pro_tier = with_spinner(
-            self.interactive,
-            &mut self.output,
-            "Checking subscription status...",
-            || async {
-                is_pro_tier(database).await
-            },
-        ).await.map_err(|e| ChatError::Custom(
-            format!("Failed to check subscription status: {}", e).into(),
-        ))?;
-
-        if pro_tier {
-            execute!(
-                self.output,
-                style::SetForegroundColor(Color::Yellow),
-                style::Print("You already have a Q Developer Pro subscription.\n\n"),
-                style::SetForegroundColor(Color::Reset),
-            )?;
-            return Ok(())
+        if !force {
+            let pro_tier = with_spinner(
+                self.interactive,
+                &mut self.output,
+                "Checking subscription status...",
+                || async {
+                    is_pro_tier(database).await
+                },
+            ).await.map_err(|e| ChatError::Custom(
+                format!("{}", e).into(),
+            ))?;
+    
+            if pro_tier {
+                execute!(
+                    self.output,
+                    style::SetForegroundColor(Color::Yellow),
+                    style::Print("You already have a Q Developer Pro subscription.\n\n"),
+                    style::SetForegroundColor(Color::DarkGrey),
+                    style::Print("Use "),
+                    style::SetForegroundColor(Color::Green),
+                    style::Print("-f"),
+                    style::SetForegroundColor(Color::DarkGrey),
+                    style::Print(", "),
+                    style::SetForegroundColor(Color::Green),
+                    style::Print("--force"),
+                    style::SetForegroundColor(Color::DarkGrey),
+                    style::Print(" start the upgrade process anyway.\n\n"),
+                    style::SetForegroundColor(Color::Reset),
+                )?;
+                return Ok(())
+            }
         }
 
         // Upgrade information
@@ -3565,7 +3596,7 @@ impl ChatContext {
             execute!(
                 self.output,
                 style::SetForegroundColor(Color::Red),
-                style::Print("Account numbers should be 12 digits - cancelling upgrade.\n\n"),
+                style::Print("Account number should be 12 digits - upgrade cancelled.\n\n"),
                 style::SetForegroundColor(Color::Reset),
             )?;
             return Ok(())
