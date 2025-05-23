@@ -125,7 +125,6 @@ impl Client {
         }
     }
 
-    #[allow(dead_code)] // TODO: Remove
     pub async fn create_subscription_token(
         &self,
         account_id: &str,
@@ -143,7 +142,6 @@ impl Client {
         }
     }
 
-    #[allow(dead_code)] // TODO: Remove
     pub async fn get_subscription_status(&self) -> Result<SubscriptionStatus, ApiClientError> {
         match &self.inner {
             inner::Inner::Codewhisperer(_) => Ok(self

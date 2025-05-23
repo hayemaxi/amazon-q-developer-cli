@@ -78,6 +78,7 @@ pub const COMMANDS: &[&str] = &[
     "/usage",
     "/save",
     "/load",
+    "/subscribe"
 ];
 
 pub fn generate_prompt(current_profile: Option<&str>, warning: bool) -> String {

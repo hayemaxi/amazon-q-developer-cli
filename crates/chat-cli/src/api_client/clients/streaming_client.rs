@@ -130,6 +130,7 @@ impl StreamingClient {
         &self,
         conversation_state: ConversationState,
     ) -> Result<SendMessageOutput, ApiClientError> {
+        return Err(ApiClientError::MonthlyLimitReached);
         debug!("Sending conversation: {:#?}", conversation_state);
         let ConversationState {
             conversation_id,

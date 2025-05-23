@@ -40,6 +40,7 @@ use std::{
     fs,
 };
 
+use amzn_codewhisperer_client::types::SubscriptionStatus;
 use command::{
     Command,
     PromptsSubcommand,
@@ -69,6 +70,7 @@ use eyre::{
     ErrReport,
     Result,
     bail,
+    eyre,
 };
 use hooks::{
     Hook,
@@ -146,6 +148,7 @@ use uuid::Uuid;
 use winnow::Partial;
 use winnow::stream::Offset;
 
+use crate::api_client::Client;
 use crate::api_client::StreamingClient;
 use crate::api_client::clients::SendMessageOutput;
 use crate::api_client::model::{
@@ -153,6 +156,7 @@ use crate::api_client::model::{
     Tool as FigTool,
     ToolResultStatus,
 };
+use crate::auth::builder_id::{BuilderIdToken, TokenType};
 use crate::database::Database;
 use crate::database::settings::Setting;
 use crate::mcp_client::{
@@ -270,6 +274,7 @@ const HELP_TEXT: &str = color_print::cstr! {"
 <em>/usage</em>        <black!>Show current session's context window usage</black!>
 <em>/load</em>         <black!>Load conversation state from a JSON file</black!>
 <em>/save</em>         <black!>Save conversation state to a JSON file</black!>
+<em>/subscribe</em>    <black!>Upgrade to a Q Developer Pro subscription for increased query limits</black!>
 
 <cyan,em>MCP:</cyan,em>
 <black!>You can now configure the Amazon Q CLI to use MCP servers. \nLearn how: https://docs.aws.amazon.com/en_us/amazonq/latest/qdeveloper-ug/command-line-mcp.html</black!>
@@ -287,6 +292,14 @@ const RESPONSE_TIMEOUT_CONTENT: &str = "Response timed out - message took too lo
 const TRUST_ALL_TEXT: &str = color_print::cstr! {"<green!>All tools are now trusted (<red!>!</red!>). Amazon Q will execute tools <bold>without</bold> asking for confirmation.\
 \nAgents can sometimes do unexpected things so understand the risks.</green!>
 \nLearn more at https://docs.aws.amazon.com/amazonq/latest/qdeveloper-ug/command-line-chat-security.html#command-line-chat-trustall-safety"};
+
+const UPGRADE_PRO_TEXT: &str = color_print::cstr! {"<white!><bold>Upgrade to Q Developer Pro Subscription - $19/month</bold></white!>
+
+<white!>1. Provide your AWS Account ID number below. (Details about where to find this?)</white!>
+<white!>2. Confirm your subscription in your AWS account. Upon confirmation, your account will begin to be charged.</white!>
+<white!>1. Provide your AWS Account ID number below. (Details about where to find this?)</white!>
+<white!>1. Provide your AWS Account ID number below. (Details about where to find this?)</white!>"};
+
 
 const TOOL_BULLET: &str = " ● ";
 const CONTINUATION_LINE: &str = " ⋮ ";
@@ -843,7 +856,7 @@ impl ChatContext {
                 } => {
                     let tool_uses_clone = tool_uses.clone();
                     tokio::select! {
-                        res = self.handle_input(telemetry, input, tool_uses, pending_tool_index) => res,
+                        res = self.handle_input(database, telemetry, input, tool_uses, pending_tool_index) => res,
                         Ok(_) = ctrl_c_stream => Err(ChatError::Interrupted { tool_uses: tool_uses_clone })
                     }
                 },
@@ -1003,6 +1016,39 @@ impl ChatContext {
                         },
                         crate::api_client::ApiClientError::QuotaBreach(msg) => {
                             print_err!(msg, err);
+                        },
+                        crate::api_client::ApiClientError::MonthlyLimitReached => {
+                            let response = is_pro_tier(database).await;
+                            if response.is_err() {
+                                execute!(
+                                    self.output,
+                                    style::SetForegroundColor(Color::Red),
+                                    style::Print(format!("{}\n\n", response.as_ref().err().unwrap())),
+                                    style::SetForegroundColor(Color::Reset),
+                                )?;
+                                // print_default_error!(err.to_string());
+                            }
+                            if response.is_err() || response.is_ok_and(|is_pro| !is_pro) {
+                                execute!(
+                                    self.output,
+                                    style::SetForegroundColor(Color::Yellow),
+                                    style::Print("You have reached your query limit for this month. Your limits will reset next month, or you can upgrade to a Pro subscription for additional limits for $19/month."),
+                                    style::SetForegroundColor(Color::DarkGrey),
+                                    style::Print("\n\nUse "),
+                                    style::SetForegroundColor(Color::Green),
+                                    style::Print("/subscribe"),
+                                    style::SetForegroundColor(Color::DarkGrey),
+                                    style::Print(" to upgrade your subscription.\n\n"),
+                                    style::SetForegroundColor(Color::Reset),
+                                )?;
+                            } else {
+                                execute!(
+                                    self.output,
+                                    style::SetForegroundColor(Color::Yellow),
+                                    style::Print("You have reached your query limit for this month. Your limits will reset next month.\n\n"),
+                                    style::SetForegroundColor(Color::Reset),
+                                )?;
+                            }
                         },
                         _ => {
                             print_default_error!(err);
@@ -1307,6 +1353,7 @@ impl ChatContext {
 
     async fn handle_input(
         &mut self,
+        database: &mut Database,
         telemetry: &TelemetryThread,
         mut user_input: String,
         tool_uses: Option<Vec<QueuedTool>>,
@@ -2999,6 +3046,15 @@ impl ChatContext {
                     skip_printing_tools: true,
                 }
             },
+            Command::Subscribe => {
+                self.upgrade_to_pro(database).await?;
+
+                return Ok(ChatState::PromptUser {
+                    tool_uses: Some(tool_uses),
+                    pending_tool_index,
+                    skip_printing_tools: true,
+                });
+            }
         })
     }
 
@@ -3537,6 +3593,148 @@ impl ChatContext {
         Ok(ChatState::ExecuteTools(queued_tools))
     }
 
+    async fn upgrade_to_pro(
+        &mut self,
+        database: &mut Database,
+    ) -> Result<(), ChatError> {
+        queue!(
+            self.output,
+            style::Print("\n"),
+        )?;
+
+        // Exit early for IDC users.
+        if is_idc_user(database).await.map_err(|e| ChatError::Custom(e.to_string().into()))? {
+            execute!(
+                self.output,
+                style::SetForegroundColor(Color::Yellow),
+                style::Print("You already have a Q Developer Pro subscription through IAM Identity Center.\n\n"),
+                style::SetForegroundColor(Color::Reset),
+            )?;
+
+            return Ok(());
+        }
+
+        // Get current subscription status
+        let pro_tier = with_spinner(
+            self.interactive,
+            &mut self.output,
+            "Checking subscription status...",
+            || async {
+                is_pro_tier(database).await
+            },
+        ).await;
+
+        match pro_tier {
+            Ok(pro_tier) => {
+                if pro_tier {
+                    execute!(
+                        self.output,
+                        style::SetForegroundColor(Color::Yellow),
+                        style::Print("You seem to already have a Q Developer Pro subscription.\n\n"),
+                        style::SetForegroundColor(Color::Reset),
+                    )?;
+
+                    // Unlike IDC detection, don't exit early in this case:
+                    // Users who unsubscribe will still appear as subscribed if they have time left
+                    // on their cancelled subscription. You cannot renew the subscription in this state on 
+                    // the console, it can only be done via the CLI (or an IDE). So, we give a simple
+                    // warning to users who may already be subscribed, but we won't block the flow.
+                }
+            },
+            Err(e) => {
+                execute!(
+                    self.output,
+                    style::SetForegroundColor(Color::Red),
+                    style::Print(format!("{e}\n\n")),
+                    style::SetForegroundColor(Color::Reset),
+                )?;
+                // Don't exit early here, the check isn't required to subscribe.
+            }
+        }
+
+        // Upgrade information
+        queue!(
+            self.output,
+            style::SetForegroundColor(Color::White),
+            style::SetAttribute(Attribute::Bold),
+            style::Print("Upgrade to Q Developer Pro Subscription - $19/month"),
+            style::SetAttribute(Attribute::Reset),
+            style::SetForegroundColor(Color::Grey),
+            style::Print("\n\nUpgrading your subscription is a two-step setup process. First, I’ll need your AWS account number. Next, you’ll need to login to that AWS account and enable your Pro subscription. Upon enabling the subscription, your account will begin to be charged."),
+            style::Print("\n\nYou can create a new AWS account here: "),
+            style::SetForegroundColor(Color::Blue),
+            style::Print("https://docs.aws.amazon.com/accounts/latest/reference/manage-acct-creating.html\n\n"),
+            style::SetForegroundColor(Color::Reset),
+            cursor::Show
+        )?;
+
+        // Get account ID from user and validate it
+        let user_input = self.read_user_input(&"Enter your AWS account number: ".dark_grey().to_string(), true);
+        execute!(
+            self.output,
+            style::Print("\n"),
+        )?;
+
+        if user_input.is_none() {
+            execute!(
+                self.output,
+                style::SetForegroundColor(Color::Red),
+                style::Print("Upgrade cancelled.\n\n"),
+                style::SetForegroundColor(Color::Reset),
+            )?;
+            return Ok(())
+        }
+        
+        let account_id = user_input.unwrap().trim().to_string();
+        if account_id.len() != 12 || !account_id.chars().all(|c| c.is_ascii_digit()) {
+            execute!(
+                self.output,
+                style::SetForegroundColor(Color::Red),
+                style::Print("Account number should be 12 digits.\n\n"),
+                style::SetForegroundColor(Color::Reset),
+            )?;
+            return Ok(())
+        }
+
+        // Create a subscription token and open the webpage
+        let response = with_spinner(
+            self.interactive,
+            &mut self.output,
+            "Preparing to upgrade...",
+            || async {
+                let r = Client::new(database, None)
+                    .await
+                    .map_err(|e| ChatError::Custom(
+                        format!("Failed to create codewhisperer client: {}", e).into(),
+                    ))?
+                    .create_subscription_token(&account_id)
+                    .await
+                    .map_err(|e| ChatError::Custom(
+                        format!("Failed to create subscription token: {}", e).into(),
+                    ))?;
+                let url = r.encoded_verification_url();
+
+                // Don't care if opening it fails, the user will see the url.
+                let _ = crate::util::open::open_url_async(url).await;
+
+                Ok::<String, ChatError>(url.to_string())
+            },
+        ).await?;
+
+        execute!(
+            self.output,
+            terminal::Clear(terminal::ClearType::CurrentLine),
+            cursor::MoveToColumn(0),
+            style::SetForegroundColor(Color::Grey),
+            style::Print("Complete the upgrade in your browser:\n"),
+            style::SetForegroundColor(Color::Blue),
+            style::Print(format!("{}\n\n", response)),
+            style::SetForegroundColor(Color::Reset),
+        )?;
+
+        Ok(())
+    }
+
     /// Apply program context to tools that Q may not have.
     // We cannot attach this any other way because Tools are constructed by deserializing
     // output from Amazon Q.
@@ -3682,6 +3880,41 @@ impl ChatContext {
     }
 }
 
+async fn with_spinner<T, E, F, Fut>(
+    interactive: bool,
+    output: &mut impl std::io::Write,
+    spinner_text: &str,
+    f: F,
+) -> Result<T, E>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<T, E>>,
+{
+    let spinner = if interactive {
+        let _ = queue!(
+            output,
+            cursor::Hide,
+        );
+        Some(Spinner::new(Spinners::Dots, spinner_text.to_owned()))
+    } else {
+        None
+    };
+
+    let result = f().await;
+
+    if let Some(mut s) = spinner {
+        s.stop();
+        let _ = queue!(
+            output,
+            terminal::Clear(terminal::ClearType::CurrentLine),
+            cursor::MoveToColumn(0),
+        );
+    }
+
+    result
+}
+
+
 /// Prints hook configuration grouped by trigger: conversation session start or per user message
 fn print_hook_section(output: &mut impl Write, hooks: &HashMap<String, Hook>, trigger: HookTrigger) -> Result<()> {
     let section = match trigger {
@@ -3776,6 +4009,25 @@ fn create_stream(model_responses: serde_json::Value) -> StreamingClient {
         mock.push(stream);
     }
     StreamingClient::mock(mock)
+}
+
+async fn is_pro_tier(database: &mut Database) -> Result<bool> {
+    if is_idc_user(database).await? {
+        return Ok(true);
+    }
+
+    let client = Client::new(database, None).await.map_err(|e| eyre!("Unable to create client: {}", e))?;
+    let status = client.get_subscription_status().await.map_err(|e| eyre!("Failed getting subscription status: {}", format!("{:?}", e)))?;
+    
+    Ok(matches!(status, SubscriptionStatus::Active))
+}
+
+async fn is_idc_user(database: &mut Database) -> Result<bool> {
+    if let Ok(Some(token)) = BuilderIdToken::load(database).await {
+        return Ok(token.token_type() == TokenType::IamIdentityCenter);
+    } else {
+        return Err(eyre!("No auth token found - is the user signed in?"));
+    }
 }
 
 #[cfg(test)]
