@@ -105,6 +105,11 @@
       "type": "int",
       "description": "The length of the files included as part of context management"
     },
+            {
+            "name": "codewhispererterminal_chatRequestLength",
+            "type": "int",
+            "description": "Number of characters in request"
+        },
     {
       "name": "codewhispererterminal_mcpServerInitFailureReason",
       "type": "string",
@@ -143,6 +148,7 @@
       "metadata": [
         { "type": "amazonqConversationId" },
         { "type": "credentialStartUrl", "required": false },
+        { "type": "ssoRegion", "required": false },
         { "type": "codewhispererterminal_inCloudshell" }
       ]
     },
@@ -152,8 +158,11 @@
       "metadata": [
         { "type": "amazonqConversationId" },
         { "type": "credentialStartUrl", "required": false },
+        { "type": "ssoRegion", "required": false },
         { "type": "codewhispererterminal_inCloudshell" },
-        { "type": "codewhispererterminal_contextFileLength", "required": false }
+        { "type": "codewhispererterminal_contextFileLength", "required": false },
+        { "type": "result", "required": true },
+        { "type": "reason", "required": false }
       ]
     },
     {
@@ -162,6 +171,7 @@
       "metadata": [
         { "type": "amazonqConversationId" },
         { "type": "credentialStartUrl", "required": false },
+        { "type": "ssoRegion", "required": false },
         { "type": "codewhispererterminal_inCloudshell" }
       ]
     },
@@ -171,6 +181,7 @@
       "passive": false,
       "metadata": [
         { "type": "credentialStartUrl" },
+        { "type": "ssoRegion" },
         { "type": "codewhispererterminal_inCloudshell" }
       ]
     },
@@ -180,6 +191,7 @@
       "passive": false,
       "metadata": [
         { "type": "credentialStartUrl" },
+        { "type": "ssoRegion" },
         { "type": "requestId" },
         { "type": "oauthFlow" },
         { "type": "result" },
@@ -261,6 +273,19 @@
         { "type": "credentialStartUrl", "required": false }
       ],
       "passive": true
+    },
+    {
+      "name": "amazonq_messageResponseError",
+      "description": "When an error has occured in response to a prompt",
+      "metadata": [
+          { "type": "credentialStartUrl", "required": false },
+          { "type": "ssoRegion", "required": false },
+          { "type": "result" },
+          { "type": "reason", "required": false },
+          { "type": "amazonqConversationId" },
+          { "type": "codewhispererterminal_chatRequestLength" },
+          { "type": "codewhispererterminal_contextFileLength", "required": false }
+      ]
     }
   ]
 }

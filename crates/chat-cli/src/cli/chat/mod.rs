@@ -153,6 +153,7 @@ use crate::api_client::model::{
     Tool as FigTool,
     ToolResultStatus,
 };
+use crate::auth::builder_id::{get_start_url_and_region};
 use crate::database::Database;
 use crate::database::settings::Setting;
 use crate::mcp_client::{
@@ -160,7 +161,7 @@ use crate::mcp_client::{
     PromptGetResult,
 };
 use crate::platform::Context;
-use crate::telemetry::TelemetryThread;
+use crate::telemetry::{TelemetryResult, TelemetryThread};
 use crate::telemetry::core::ToolUseEventBuilder;
 use crate::util::CLI_BINARY_NAME;
 
@@ -814,6 +815,11 @@ impl ChatContext {
             });
         }
 
+        let (start_url, region) = get_start_url_and_region(database).await;
+        if let Err(e) = telemetry.send_chat_start(self.conversation_state.conversation_id().to_string(), start_url, region) {
+            error!(?e, "failed to send chat start event");
+        }
+
         loop {
             debug_assert!(next_state.is_some());
             let chat_state = next_state.take().unwrap_or_default();
@@ -877,8 +883,16 @@ impl ChatContext {
                     res = self.handle_response(database, telemetry, response) => res,
                     Ok(_) = ctrl_c_stream => Err(ChatError::Interrupted { tool_uses: None })
                 },
-                ChatState::Exit => return Ok(()),
+                ChatState::Exit => {
+                    let (start_url, region) = get_start_url_and_region(database).await;
+                    if let Err(e) = telemetry.send_chat_end(self.conversation_state.conversation_id().to_string(), start_url, region) {
+                        error!(?e, "failed to send chat start event");
+                    }
+                    return Ok(())
+                },
             };
+
+            // if emit_interrputed
 
             next_state = Some(self.handle_state_execution_result(database, result).await?);
         }
@@ -1145,6 +1159,8 @@ impl ChatContext {
                     self.conversation_state.conversation_id().to_owned(),
                     message_id.to_owned(),
                     self.conversation_state.context_message_length(),
+                    TelemetryResult::Succeeded,
+                    None
                 )
                 .ok();
         }
@@ -3249,6 +3265,17 @@ impl ChatContext {
                     if let Some(request_id) = &recv_error.request_id {
                         self.failed_request_ids.push(request_id.clone());
                     };
+                    if let Some(message_id) = self.conversation_state.message_id() {
+                        telemetry
+                            .send_chat_added_message(
+                                self.conversation_state.conversation_id().to_owned(),
+                                message_id.to_owned(),
+                                self.conversation_state.context_message_length(),
+                                TelemetryResult::Failed,
+                                Some(recv_error.to_string())
+                            )
+                            .ok();
+                    }
 
                     match recv_error.source {
                         RecvErrorKind::StreamTimeout { source, duration } => {
@@ -3390,6 +3417,8 @@ impl ChatContext {
                             self.conversation_state.conversation_id().to_owned(),
                             message_id.to_owned(),
                             self.conversation_state.context_message_length(),
+                            TelemetryResult::Succeeded,
+                            None
                         )
                         .ok();
                 }

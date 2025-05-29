@@ -29,6 +29,7 @@ use cognito::{
     CognitoProvider,
     get_cognito_credentials,
 };
+use crossterm::{execute, style};
 use endpoint::StaticEndpoint;
 pub use install_method::{
     InstallMethod,
@@ -177,8 +178,13 @@ impl TelemetryThread {
         Ok(())
     }
 
+    fn send(&self, event: Event) -> Result<(), TelemetryError> {
+        self.tx.send(event)?;
+        Ok(())
+    }
+
     pub fn send_user_logged_in(&self) -> Result<(), TelemetryError> {
-        Ok(self.tx.send(Event::new(EventType::UserLoggedIn {}))?)
+        Ok(self.send(Event::new(EventType::UserLoggedIn {}))?)
     }
 
     pub fn send_cli_subcommand_executed(&self, subcommand: Option<&CliRootCommands>) -> Result<(), TelemetryError> {
@@ -189,8 +195,33 @@ impl TelemetryThread {
         .to_owned();
 
         Ok(self
-            .tx
             .send(Event::new(EventType::CliSubcommandExecuted { subcommand }))?)
+    }
+
+    pub fn send_chat_start(
+        &self,
+        conversation_id: String,
+        credential_start_url: Option<String>,
+        sso_region: Option<String>,
+    ) -> Result<(), TelemetryError> {
+        Ok(self.send(Event::new(EventType::ChatStart {
+            conversation_id,
+            credential_start_url,
+            sso_region,
+        }))?)
+    }
+
+    pub fn send_chat_end(
+        &self,
+        conversation_id: String,
+        credential_start_url: Option<String>,
+        sso_region: Option<String>,
+    ) -> Result<(), TelemetryError> {
+        Ok(self.send(Event::new(EventType::ChatEnd {
+            conversation_id,
+            credential_start_url,
+            sso_region,
+        }))?)
     }
 
     pub fn send_chat_added_message(
@@ -198,16 +229,20 @@ impl TelemetryThread {
         conversation_id: String,
         message_id: String,
         context_file_length: Option<usize>,
+        result: TelemetryResult,
+        reason: Option<String>,
     ) -> Result<(), TelemetryError> {
-        Ok(self.tx.send(Event::new(EventType::ChatAddedMessage {
+        Ok(self.send(Event::new(EventType::ChatAddedMessage {
             conversation_id,
             message_id,
             context_file_length,
+            result,
+            reason,
         }))?)
     }
 
     pub fn send_tool_use_suggested(&self, event: ToolUseEventBuilder) -> Result<(), TelemetryError> {
-        Ok(self.tx.send(Event::new(EventType::ToolUseSuggested {
+        Ok(self.send(Event::new(EventType::ToolUseSuggested {
             conversation_id: event.conversation_id,
             utterance_id: event.utterance_id,
             user_input_id: event.user_input_id,
@@ -229,7 +264,7 @@ impl TelemetryThread {
         init_failure_reason: Option<String>,
         number_of_tools: usize,
     ) -> Result<(), TelemetryError> {
-        Ok(self.tx.send(Event::new(crate::telemetry::EventType::McpServerInit {
+        Ok(self.send(Event::new(crate::telemetry::EventType::McpServerInit {
             conversation_id,
             init_failure_reason,
             number_of_tools,
@@ -244,7 +279,7 @@ impl TelemetryThread {
         sso_region: Option<String>,
         profile_count: Option<i64>,
     ) -> Result<(), TelemetryError> {
-        Ok(self.tx.send(Event::new(EventType::DidSelectProfile {
+        Ok(self.send(Event::new(EventType::DidSelectProfile {
             source,
             amazonq_profile_region,
             result,
@@ -260,12 +295,23 @@ impl TelemetryThread {
         result: TelemetryResult,
         sso_region: Option<String>,
     ) -> Result<(), TelemetryError> {
-        Ok(self.tx.send(Event::new(EventType::ProfileState {
+        Ok(self.send(Event::new(EventType::ProfileState {
             source,
             amazonq_profile_region,
             result,
             sso_region,
         }))?)
+    }
+
+    pub fn send_response_error(
+        &self,
+        conversation_id: String,
+        context_file_length: Option<usize>,
+        message_request_length: Option<usize>,
+        result: TelemetryResult,
+        reason: Option<String>,
+    ) -> Result<(), TelemetryError> {
+        Ok(self.send(Event::new(EventType::MessageResponseError { result, reason, conversation_id, context_file_length, message_request_length }))?)
     }
 }
 

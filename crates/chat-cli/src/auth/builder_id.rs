@@ -536,6 +536,14 @@ pub async fn logout(database: &mut Database) -> Result<(), AuthError> {
     Ok(())
 }
 
+pub async fn get_start_url_and_region(database: &mut Database) -> (Option<String>, Option<String>) {
+    let token = BuilderIdToken::load(database).await;
+    match token {
+        Ok(Some(t)) => (t.start_url, t.region),
+        _ => (None, None),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct BearerResolver;
 

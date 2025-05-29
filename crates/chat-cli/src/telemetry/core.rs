@@ -11,6 +11,7 @@ use crate::telemetry::definitions::IntoMetricDatum;
 use crate::telemetry::definitions::metrics::{
     AmazonqDidSelectProfile,
     AmazonqEndChat,
+    AmazonqMessageResponseError,
     AmazonqProfileState,
     AmazonqStartChat,
     CodewhispererterminalAddChatMessage,
@@ -35,12 +36,15 @@ use crate::telemetry::definitions::types::{
     CodewhispererterminalUtteranceId,
 };
 
+use super::definitions::types::SsoRegion;
+
 /// A serializable telemetry event that can be sent or queued.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Event {
     pub created_time: Option<SystemTime>,
     pub credential_start_url: Option<String>,
+    pub sso_region: Option<String>,
     #[serde(flatten)]
     pub ty: EventType,
 }
@@ -51,7 +55,16 @@ impl Event {
             ty,
             created_time: Some(SystemTime::now()),
             credential_start_url: None,
+            sso_region: None,
         }
+    }
+
+    pub fn set_start_url(&mut self, url: String) {
+        self.credential_start_url = Some(url);
+    }
+
+    pub fn set_region(&mut self, region: String) {
+        self.sso_region = Some(region);
     }
 
     pub fn into_metric_datum(self) -> Option<MetricDatum> {
@@ -61,6 +74,7 @@ impl Event {
                     create_time: self.created_time,
                     value: None,
                     credential_start_url: self.credential_start_url.map(Into::into),
+                    sso_region: self.sso_region.map(Into::into),
                     codewhispererterminal_in_cloudshell: in_cloudshell(),
                 }
                 .into_metric_datum(),
@@ -75,6 +89,7 @@ impl Event {
                     create_time: self.created_time,
                     value: None,
                     credential_start_url: self.credential_start_url.map(Into::into),
+                    sso_region: self.sso_region.map(Into::into),
                     request_id: Some(request_id.into()),
                     result: Some(result.to_string().into()),
                     reason: reason.map(Into::into),
@@ -93,21 +108,23 @@ impl Event {
                 }
                 .into_metric_datum(),
             ),
-            EventType::ChatStart { conversation_id } => Some(
+            EventType::ChatStart { conversation_id, credential_start_url, sso_region } => Some(
                 AmazonqStartChat {
                     create_time: self.created_time,
                     value: None,
-                    credential_start_url: self.credential_start_url.map(Into::into),
+                    credential_start_url: credential_start_url.map(Into::into),
+                    sso_region: sso_region.map(Into::into),
                     amazonq_conversation_id: Some(conversation_id.into()),
                     codewhispererterminal_in_cloudshell: in_cloudshell(),
                 }
                 .into_metric_datum(),
             ),
-            EventType::ChatEnd { conversation_id } => Some(
+            EventType::ChatEnd { conversation_id, credential_start_url, sso_region } => Some(
                 AmazonqEndChat {
                     create_time: self.created_time,
                     value: None,
-                    credential_start_url: self.credential_start_url.map(Into::into),
+                    credential_start_url: credential_start_url.map(Into::into),
+                    sso_region: sso_region.map(Into::into),
                     amazonq_conversation_id: Some(conversation_id.into()),
                     codewhispererterminal_in_cloudshell: in_cloudshell(),
                 }
@@ -116,6 +133,8 @@ impl Event {
             EventType::ChatAddedMessage {
                 conversation_id,
                 context_file_length,
+                result,
+                reason,
                 ..
             } => Some(
                 CodewhispererterminalAddChatMessage {
@@ -123,8 +142,11 @@ impl Event {
                     value: None,
                     amazonq_conversation_id: Some(conversation_id.into()),
                     credential_start_url: self.credential_start_url.map(Into::into),
+                    sso_region: self.sso_region.map(Into::into),
                     codewhispererterminal_in_cloudshell: in_cloudshell(),
                     codewhispererterminal_context_file_length: context_file_length.map(|l| l as i64).map(Into::into),
+                    result: result.to_string().into(),
+                    reason: reason.map(Into::into),
                 }
                 .into_metric_datum(),
             ),
@@ -218,6 +240,26 @@ impl Event {
                 }
                 .into_metric_datum(),
             ),
+            EventType::MessageResponseError {
+                conversation_id,
+                context_file_length,
+                message_request_length,
+                reason,
+                result,
+            } => Some(
+                AmazonqMessageResponseError {
+                    create_time: self.created_time,
+                    value: None,
+                    amazonq_conversation_id: Some(conversation_id.into()),
+                    codewhispererterminal_context_file_length: context_file_length.map(|l| l as i64).map(Into::into),
+                    codewhispererterminal_chat_request_length: message_request_length.map(|l| l as i64).map(Into::into),
+                    reason: reason.map(Into::into),
+                    result: Some(result.to_string().into()),
+                    credential_start_url: self.credential_start_url.map(Into::into),
+                    sso_region: self.sso_region.map(Into::into),
+                }
+                .into_metric_datum(),
+            ),
         }
     }
 }
@@ -238,14 +280,20 @@ pub enum EventType {
     },
     ChatStart {
         conversation_id: String,
+        credential_start_url: Option<String>,
+        sso_region: Option<String>,
     },
     ChatEnd {
         conversation_id: String,
+        credential_start_url: Option<String>,
+        sso_region: Option<String>,
     },
     ChatAddedMessage {
         conversation_id: String,
         message_id: String,
         context_file_length: Option<usize>,
+        result: TelemetryResult,
+        reason: Option<String>,
     },
     ToolUseSuggested {
         conversation_id: String,
@@ -278,6 +326,13 @@ pub enum EventType {
         amazonq_profile_region: String,
         result: TelemetryResult,
         sso_region: Option<String>,
+    },
+    MessageResponseError {
+        result: TelemetryResult,
+        reason: Option<String>,
+        conversation_id: String,
+        context_file_length: Option<usize>,
+        message_request_length: Option<usize>,
     },
 }
 
