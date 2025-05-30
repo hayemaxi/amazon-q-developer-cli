@@ -24,6 +24,7 @@ use std::collections::{
     HashSet,
     VecDeque,
 };
+use std::error::Error;
 use std::io::{
     IsTerminal,
     Read,
@@ -40,6 +41,7 @@ use std::{
     fs,
 };
 
+use color_eyre::Section;
 use command::{
     Command,
     PromptsSubcommand,
@@ -66,9 +68,7 @@ use crossterm::{
     terminal,
 };
 use eyre::{
-    ErrReport,
-    Result,
-    bail,
+    bail, Chain, ErrReport, Result
 };
 use hooks::{
     Hook,
@@ -815,11 +815,6 @@ impl ChatContext {
             });
         }
 
-        let (start_url, region) = get_start_url_and_region(database).await;
-        if let Err(e) = telemetry.send_chat_start(self.conversation_state.conversation_id().to_string(), start_url, region) {
-            error!(?e, "failed to send chat start event");
-        }
-
         loop {
             debug_assert!(next_state.is_some());
             let chat_state = next_state.take().unwrap_or_default();
@@ -882,18 +877,12 @@ impl ChatContext {
                 ChatState::HandleResponseStream(response) => tokio::select! {
                     res = self.handle_response(database, telemetry, response) => res,
                     Ok(_) = ctrl_c_stream => {
-                        self.send_chat_telem(telemetry, database, TelemetryResult::Cancelled, None).await;
+                        self.send_chat_telem(database, telemetry, TelemetryResult::Cancelled, None).await;
 
                         Err(ChatError::Interrupted { tool_uses: None })
                     }
                 },
-                ChatState::Exit => {
-                    let (start_url, region) = get_start_url_and_region(database).await;
-                    if let Err(e) = telemetry.send_chat_end(self.conversation_state.conversation_id().to_string(), start_url, region) {
-                        error!(?e, "failed to send chat start event");
-                    }
-                    return Ok(())
-                },
+                ChatState::Exit => return Ok(()),
             };
 
             // if emit_interrputed
@@ -915,7 +904,14 @@ impl ChatContext {
         match result {
             Ok(state) => Ok(state),
             Err(e) => {
-                self.send_error_telem(telemetry, database, TelemetryResult::Failed, Some(e.to_string())).await;
+                // Telemetry
+                let err_chain = Chain::new(&e);
+                let err_string = if err_chain.len() > 1 {
+                    format!("'{}' caused by: {}", e, err_chain.last().map(|e| e.to_string()).unwrap_or("UNKNOWN".to_string()))
+                } else {
+                    e.to_string()
+                };
+                self.send_error_telem(database, telemetry, err_string).await;
 
                 macro_rules! print_err {
                     ($prepend_msg:expr, $err:expr) => {{
@@ -1108,7 +1104,7 @@ impl ChatContext {
         let response = match response {
             Ok(res) => res,
             Err(e) => {
-                self.send_chat_telem(telemetry, database, TelemetryResult::Failed, Some(e.to_string())).await;
+                self.send_chat_telem(database, telemetry, TelemetryResult::Failed, Some(e.to_string())).await;
                 match e {
                 crate::api_client::ApiClientError::ContextWindowOverflow => {
                     self.conversation_state.clear(true);
@@ -1147,7 +1143,7 @@ impl ChatContext {
                         if let Some(request_id) = &err.request_id {
                             self.failed_request_ids.push(request_id.clone());
                         };
-                        self.send_chat_telem(telemetry, database, TelemetryResult::Failed, Some(err.to_string())).await;
+                        self.send_chat_telem(database, telemetry, TelemetryResult::Failed, Some(err.to_string())).await;
                         return Err(err.into());
                     },
                 }
@@ -1163,7 +1159,7 @@ impl ChatContext {
                 cursor::Show
             )?;
         }
-        self.send_chat_telem(telemetry, database, TelemetryResult::Succeeded, None).await;
+        self.send_chat_telem(database, telemetry, TelemetryResult::Succeeded, None).await;
 
         self.conversation_state.replace_history_with_summary(summary.clone());
 
@@ -3268,7 +3264,7 @@ impl ChatContext {
                         self.failed_request_ids.push(request_id.clone());
                     };
 
-                    self.send_chat_telem(telemetry, database, TelemetryResult::Failed, Some(recv_error.to_string())).await;
+                    self.send_chat_telem(database, telemetry, TelemetryResult::Failed, Some(recv_error.to_string())).await;
 
                     match recv_error.source {
                         RecvErrorKind::StreamTimeout { source, duration } => {
@@ -3404,7 +3400,7 @@ impl ChatContext {
             }
 
             if ended {
-                self.send_chat_telem(telemetry, database, TelemetryResult::Succeeded, None).await;
+                self.send_chat_telem(database, telemetry, TelemetryResult::Succeeded, None).await;
 
                 if self.interactive
                     && database
@@ -3693,7 +3689,7 @@ impl ChatContext {
         Ok(())
     }
 
-    async fn send_chat_telem(&self, telemetry: &TelemetryThread, database: &mut Database, result: TelemetryResult, reason: Option<String>) {
+    async fn send_chat_telem(&self, database: &mut Database, telemetry: &TelemetryThread, result: TelemetryResult, reason: Option<String>) {
         if let Some(message_id) = self.conversation_state.message_id() {
             let (start_url, region) = get_start_url_and_region(database).await;
 
@@ -3712,7 +3708,7 @@ impl ChatContext {
     }
 
 
-    async fn send_error_telem(&self, telemetry: &TelemetryThread, database: &mut Database, result: TelemetryResult, reason: Option<String>) {
+    async fn send_error_telem(&self, database: &mut Database, telemetry: &TelemetryThread, reason: String) {
         let (start_url, region) = get_start_url_and_region(database).await;
 
         telemetry
@@ -3721,8 +3717,8 @@ impl ChatContext {
                 self.conversation_state.context_message_length(),
                 start_url,
                 region,
-                result,
-                reason
+                TelemetryResult::Failed,
+                Some(reason)
             )
             .ok();
     }

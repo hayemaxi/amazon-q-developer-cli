@@ -198,32 +198,6 @@ impl TelemetryThread {
             .send(Event::new(EventType::CliSubcommandExecuted { subcommand }))?)
     }
 
-    pub fn send_chat_start(
-        &self,
-        conversation_id: String,
-        credential_start_url: Option<String>,
-        sso_region: Option<String>,
-    ) -> Result<(), TelemetryError> {
-        Ok(self.send(Event::new(EventType::ChatStart {
-            conversation_id,
-            credential_start_url,
-            sso_region,
-        }))?)
-    }
-
-    pub fn send_chat_end(
-        &self,
-        conversation_id: String,
-        credential_start_url: Option<String>,
-        sso_region: Option<String>,
-    ) -> Result<(), TelemetryError> {
-        Ok(self.send(Event::new(EventType::ChatEnd {
-            conversation_id,
-            credential_start_url,
-            sso_region,
-        }))?)
-    }
-
     pub fn send_chat_added_message(
         &self,
         conversation_id: String,

@@ -156,6 +156,7 @@
         { "type": "ssoRegion", "required": false },
         { "type": "codewhispererterminal_inCloudshell" },
         { "type": "codewhispererterminal_contextFileLength", "required": false },
+        { "type": "requestId" },
         { "type": "result", "required": true },
         { "type": "reason", "required": false }
       ]
