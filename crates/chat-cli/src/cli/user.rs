@@ -195,7 +195,7 @@ impl UserSubcommand {
 
                 if let Ok(Some(token)) = BuilderIdToken::load(database).await {
                     if matches!(token.token_type(), TokenType::BuilderId) {
-                        bail!("This command is only available for Pro users");
+                        bail!("This command is only available for IAM Identity Center users");
                     }
                 }
 

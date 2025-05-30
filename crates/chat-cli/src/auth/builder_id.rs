@@ -48,6 +48,10 @@ use tracing::{
     trace,
     warn,
 };
+use eyre::{
+    Result,
+    eyre,
+};
 
 use crate::api_client::clients::shared::stalled_stream_protection_config;
 use crate::auth::AuthError;
@@ -565,6 +569,14 @@ impl ResolveIdentity for BearerResolver {
                 None => Err(AuthError::NoToken.into()),
             }
         }))
+    }
+}
+
+pub async fn is_idc_user(database: &Database) -> Result<bool> {
+    if let Ok(Some(token)) = BuilderIdToken::load(database).await {
+        return Ok(token.token_type() == TokenType::IamIdentityCenter);
+    } else {
+        return Err(eyre!("No auth token found - is the user signed in?"));
     }
 }
 
