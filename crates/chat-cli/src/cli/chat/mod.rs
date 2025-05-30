@@ -40,6 +40,7 @@ use std::{
     io,
 };
 
+use amzn_codewhisperer_client::types::SubscriptionStatus;
 use clap::Args;
 use command::{
     Command,
@@ -101,6 +102,7 @@ use spinners::{
     Spinners,
 };
 use thiserror::Error;
+use time::OffsetDateTime;
 use token_counter::{
     TokenCount,
     TokenCounter,
@@ -146,13 +148,19 @@ use uuid::Uuid;
 use winnow::Partial;
 use winnow::stream::Offset;
 
-use crate::api_client::StreamingClient;
 use crate::api_client::clients::SendMessageOutput;
 use crate::api_client::model::{
     ChatResponseStream,
     Tool as FigTool,
     ToolResultStatus,
 };
+use crate::api_client::{
+    ApiClientError,
+    Client,
+    StreamingClient,
+};
+use crate::auth::AuthError;
+use crate::auth::builder_id::is_idc_user;
 use crate::database::Database;
 use crate::database::settings::Setting;
 use crate::mcp_client::{
@@ -502,6 +510,7 @@ const HELP_TEXT: &str = color_print::cstr! {"
 <em>/usage</em>        <black!>Show current session's context window usage</black!>
 <em>/load</em>         <black!>Load conversation state from a JSON file</black!>
 <em>/save</em>         <black!>Save conversation state to a JSON file</black!>
+<em>/subscribe</em>    <black!>Upgrade to a Q Developer Pro subscription for increased query limits</black!>
 
 <cyan,em>MCP:</cyan,em>
 <black!>You can now configure the Amazon Q CLI to use MCP servers. \nLearn how: https://docs.aws.amazon.com/en_us/amazonq/latest/qdeveloper-ug/command-line-mcp.html</black!>
@@ -519,6 +528,11 @@ const RESPONSE_TIMEOUT_CONTENT: &str = "Response timed out - message took too lo
 const TRUST_ALL_TEXT: &str = color_print::cstr! {"<green!>All tools are now trusted (<red!>!</red!>). Amazon Q will execute tools <bold>without</bold> asking for confirmation.\
 \nAgents can sometimes do unexpected things so understand the risks.</green!>
 \nLearn more at https://docs.aws.amazon.com/amazonq/latest/qdeveloper-ug/command-line-chat-security.html#command-line-chat-trustall-safety"};
+
+const SUBSCRIBE_TITLE_TEXT: &str =
+    color_print::cstr! { "<white!,bold>Upgrade subscription to Q Developer Pro</white!,bold>" };
+const SUBSCRIBE_TEXT: &str = color_print::cstr! { "Connect your Builder ID to an AWS account to upgrade to Q Developer Pro and increase your monthly limits. \
+Learn more about perks and pricing > <blue!>https://aws.amazon.com/q/developer/pricing/</blue!>" };
 
 const TOOL_BULLET: &str = " ● ";
 const CONTINUATION_LINE: &str = " ⋮ ";
@@ -539,6 +553,8 @@ enum ToolUseStatus {
 pub enum ChatError {
     #[error("{0}")]
     Client(#[from] crate::api_client::ApiClientError),
+    #[error("{0}")]
+    Auth(#[from] AuthError),
     #[error("{0}")]
     ResponseStream(#[from] parser::RecvError),
     #[error("{0}")]
@@ -1137,6 +1153,56 @@ impl ChatContext {
                                 style::SetAttribute(Attribute::Reset),
                                 style::SetForegroundColor(Color::Reset),
                             )?;
+                        },
+                        crate::api_client::ApiClientError::MonthlyLimitReached => {
+                            let subscription_status = get_subscription_status(database).await;
+                            if subscription_status.is_err() {
+                                execute!(
+                                    self.output,
+                                    style::SetForegroundColor(Color::Red),
+                                    style::Print(format!(
+                                        "Unable to verify subscription status: {}\n\n",
+                                        subscription_status.as_ref().err().unwrap()
+                                    )),
+                                    style::SetForegroundColor(Color::Reset),
+                                )?;
+                            }
+
+                            execute!(
+                                self.output,
+                                style::SetForegroundColor(Color::Yellow),
+                                style::Print("You have reached your monthly invocation limit. "),
+                            )?;
+
+                            let limits_text = format!(
+                                "Limits reset on {:02}/01.",
+                                OffsetDateTime::now_utc().month().next() as u8
+                            );
+
+                            if subscription_status.is_err()
+                                || subscription_status.is_ok_and(|s| s == ActualSubscriptionStatus::None)
+                            {
+                                execute!(
+                                    self.output,
+                                    style::Print(format!(
+                                        "Connect your Builder ID to an AWS account to upgrade to Q Developer Pro and increase your monthly limits. {limits_text}"
+                                    )),
+                                    style::SetForegroundColor(Color::DarkGrey),
+                                    style::Print("\n\nUse "),
+                                    style::SetForegroundColor(Color::Green),
+                                    style::Print("/subscribe"),
+                                    style::SetForegroundColor(Color::DarkGrey),
+                                    style::Print(" to upgrade your subscription.\n\n"),
+                                    style::SetForegroundColor(Color::Reset),
+                                )?;
+                            } else {
+                                execute!(
+                                    self.output,
+                                    style::SetForegroundColor(Color::Yellow),
+                                    style::Print(format!("{limits_text}\n\n")),
+                                    style::SetForegroundColor(Color::Reset),
+                                )?;
+                            }
                         },
                         _ => {
                             print_default_error!(err);
@@ -3240,6 +3306,15 @@ impl ChatContext {
                     skip_printing_tools: false,
                 }
             },
+            Command::Subscribe => {
+                self.upgrade_to_pro(database).await?;
+
+                return Ok(ChatState::PromptUser {
+                    tool_uses: Some(tool_uses),
+                    pending_tool_index,
+                    skip_printing_tools: true,
+                });
+            },
         })
     }
 
@@ -3760,6 +3835,118 @@ impl ChatContext {
         Ok(ChatState::ExecuteTools(queued_tools))
     }
 
+    async fn upgrade_to_pro(&mut self, database: &mut Database) -> Result<(), ChatError> {
+        queue!(self.output, style::Print("\n"),)?;
+
+        // Exit early for IDC users.
+        if is_idc_user(database)
+            .await
+            .map_err(|e| ChatError::Custom(e.to_string().into()))?
+        {
+            execute!(
+                self.output,
+                style::SetForegroundColor(Color::Yellow),
+                style::Print("You already have a Q Developer Pro subscription through IAM Identity Center.\n\n"),
+                style::SetForegroundColor(Color::Reset),
+            )?;
+
+            return Ok(());
+        }
+
+        // Get current subscription status
+        let subscription_status = with_spinner(
+            self.interactive,
+            &mut self.output,
+            "Checking subscription status...",
+            || async { get_subscription_status(database).await },
+        )
+        .await;
+
+        match subscription_status {
+            Ok(status) => {
+                if status == ActualSubscriptionStatus::Active {
+                    queue!(
+                        self.output,
+                        style::SetForegroundColor(Color::Yellow),
+                        style::Print("Your Builder ID already has a Q Developer Pro subscription.\n\n"),
+                        style::SetForegroundColor(Color::Reset),
+                    )?;
+                    return Ok(());
+                }
+            },
+            Err(e) => {
+                execute!(
+                    self.output,
+                    style::SetForegroundColor(Color::Red),
+                    style::Print(format!("{}\n\n", e)),
+                    style::SetForegroundColor(Color::Reset),
+                )?;
+                // Don't exit early here, the check isn't required to subscribe.
+            },
+        }
+
+        // Upgrade information
+        queue!(
+            self.output,
+            style::Print(SUBSCRIBE_TITLE_TEXT),
+            style::SetForegroundColor(Color::Grey),
+            style::Print(format!("\n\n{}\n\n", SUBSCRIBE_TEXT)),
+            style::SetForegroundColor(Color::Reset),
+            cursor::Show
+        )?;
+
+        let prompt = format!(
+            "{}{}{}{}{}",
+            "Would you like to open the upgrade URL? [".dark_grey(),
+            "y".green(),
+            "/".dark_grey(),
+            "n".green(),
+            "]: ".dark_grey(),
+        );
+
+        let user_input = self.read_user_input(&prompt, true);
+        queue!(self.output, style::SetForegroundColor(Color::Reset), style::Print("\n"),)?;
+
+        if !user_input.is_some_and(|i| ["y", "Y"].contains(&i.as_str())) {
+            execute!(
+                self.output,
+                style::SetForegroundColor(Color::Red),
+                style::Print("Upgrade cancelled.\n\n"),
+                style::SetForegroundColor(Color::Reset),
+            )?;
+            return Ok(());
+        }
+
+        // Create a subscription token and open the webpage
+        let response = with_spinner(
+            self.interactive,
+            &mut self.output,
+            "Preparing to upgrade...",
+            || async {
+                let r = Client::new(database, None).await?.create_subscription_token().await?;
+                let url = r.encoded_verification_url();
+
+                // Don't care if opening it fails, the user will see the url.
+                if !cfg!(test) {
+                    let _ = crate::util::open::open_url_async(url).await;
+                }
+
+                Ok::<String, ChatError>(url.to_string())
+            },
+        )
+        .await?;
+
+        execute!(
+            self.output,
+            style::SetForegroundColor(Color::DarkGrey),
+            style::Print(format!("{} Open console page > {}\n\n", "?".magenta(), response.blue())),
+            style::SetForegroundColor(Color::Reset),
+            style::Print("Once upgraded, type a new prompt to continue you work, or type /quit to exit the chat.\n\n")
+        )?;
+
+        Ok(())
+    }
+
     /// Apply program context to tools that Q may not have.
     // We cannot attach this any other way because Tools are constructed by deserializing
     // output from Amazon Q.
@@ -3950,6 +4137,38 @@ impl ChatContext {
     }
 }
 
+/// Display a spinner + text while waiting for an async function to finish.
+async fn with_spinner<T, E, F, Fut>(
+    interactive: bool,
+    output: &mut impl std::io::Write,
+    spinner_text: &str,
+    f: F,
+) -> Result<T, E>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<T, E>>,
+{
+    let spinner = if interactive {
+        let _ = queue!(output, cursor::Hide,);
+        Some(Spinner::new(Spinners::Dots, spinner_text.to_owned()))
+    } else {
+        None
+    };
+
+    let result = f().await;
+
+    if let Some(mut s) = spinner {
+        s.stop();
+        let _ = queue!(
+            output,
+            terminal::Clear(terminal::ClearType::CurrentLine),
+            cursor::MoveToColumn(0),
+        );
+    }
+
+    result
+}
+
 /// Prints hook configuration grouped by trigger: conversation session start or per user message
 fn print_hook_section(output: &mut impl Write, hooks: &HashMap<String, Hook>, trigger: HookTrigger) -> Result<()> {
     let section = match trigger {
@@ -4046,9 +4265,75 @@ fn create_stream(model_responses: serde_json::Value) -> StreamingClient {
     StreamingClient::mock(mock)
 }
 
+/// Replaces amzn_codewhisperer_client::types::SubscriptionStatus with a more descriptive type.
+/// See response expectations in [`get_subscription_status`] for reasoning.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ActualSubscriptionStatus {
+    Active,   // User has paid for this month
+    Expiring, // User has paid for this month but cancelled
+    None,     // User has not paid for this month
+}
+
+// NOTE: The subscription API behaves in a non-intuitive way. We expect the following responses:
+//
+// 1. SubscriptionStatus::Active:
+//    - The user *has* a subscription, but it is set to *not auto-renew* (i.e., cancelled).
+//    - We return ActualSubscriptionStatus::Expiring to indicate they are eligible to re-subscribe
+//
+// 2. SubscriptionStatus::Inactive:
+//    - The user has no subscription at all (no Pro access).
+//    - We return ActualSubscriptionStatus::None to indicate they are eligible to subscribe.
+//
+// 3. ConflictException (as an error):
+//    - The user already has an active subscription *with auto-renewal enabled*.
+//    - We return ActualSubscriptionStatus::Active since they don’t need to subscribe again.
+//
+// Also, it is currently not possible to subscribe or re-subscribe via console, only IDE/CLI.
+async fn get_subscription_status(database: &mut Database) -> Result<ActualSubscriptionStatus> {
+    if is_idc_user(database).await? {
+        return Ok(ActualSubscriptionStatus::Active);
+    }
+
+    let client = Client::new(database, None).await?;
+    match client.create_subscription_token().await {
+        Ok(response) => match response.status() {
+            SubscriptionStatus::Active => Ok(ActualSubscriptionStatus::Expiring),
+            SubscriptionStatus::Inactive => Ok(ActualSubscriptionStatus::None),
+            _ => Ok(ActualSubscriptionStatus::None),
+        },
+        Err(ApiClientError::CreateSubscriptionToken(e)) => {
+            let sdk_error_code = e.as_service_error().and_then(|err| err.meta().code());
+
+            if sdk_error_code.is_some_and(|c| c.contains("ConflictException")) {
+                Ok(ActualSubscriptionStatus::Active)
+            } else {
+                Err(e.into())
+            }
+        },
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Returns surface error + root cause as a string. If there is only one error
+/// in the chain, return that as a string.
+fn get_error_string(error: &(dyn Error + 'static)) -> String {
+    let err_chain = Chain::new(error);
+
+    if err_chain.len() > 1 {
+        format!(
+            "'{}' caused by: {}",
+            error,
+            err_chain.last().map_or("UNKNOWN".to_string(), |e| e.to_string())
+        )
+    } else {
+        error.to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::chat::util::shared_writer::TestWriterWithSink;
     use crate::platform::Env;
 
     #[tokio::test]
@@ -4450,5 +4735,46 @@ mod tests {
             let processed = input.trim().to_string();
             assert_eq!(processed, expected.trim().to_string(), "Failed for input: {}", input);
         }
+    }
+
+    #[tokio::test]
+    async fn test_subscribe_flow() {
+        let ctx = Context::builder().with_test_home().await.unwrap().build_fake();
+
+        let env = Env::new();
+        let mut database = Database::new().await.unwrap();
+        let telemetry = TelemetryThread::new(&env, &mut database).await.unwrap();
+
+        let buf = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let test_writer = TestWriterWithSink { sink: buf.clone() };
+        let output = SharedWriter::new(test_writer.clone());
+
+        let tool_manager = ToolManager::default();
+        let tool_config = serde_json::from_str::<HashMap<String, ToolSpec>>(include_str!("tools/tool_index.json"))
+            .expect("Tools failed to load");
+        ChatContext::new(
+            Arc::clone(&ctx),
+            &mut database,
+            "fake_conv_id",
+            output,
+            None,
+            InputSource::new_mock(vec!["/subscribe".to_string(), "y".to_string(), "/quit".to_string()]),
+            true,
+            false,
+            create_stream(serde_json::json!([])),
+            || Some(80),
+            tool_manager,
+            None,
+            tool_config,
+            ToolPermissions::new(0),
+        )
+        .await
+        .unwrap()
+        .try_chat(&mut database, &telemetry)
+        .await
+        .unwrap();
+
+        let output = String::from_utf8(test_writer.get_content()).expect("Invalid output");
+        assert!(output.contains("test/url"));
     }
 }

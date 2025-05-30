@@ -9,7 +9,6 @@ use amzn_codewhisperer_client::types::{
 use tracing::error;
 
 use super::shared::bearer_sdk_config;
-use crate::api_client::consts::SUBSCRIPTION_STATUS_ACCOUNT_ID;
 use crate::api_client::interceptor::opt_out::OptOutInterceptor;
 use crate::api_client::{
     ApiClientError,
@@ -127,33 +126,18 @@ impl Client {
         }
     }
 
-    #[allow(dead_code)] // TODO: Remove
-    pub async fn create_subscription_token(
-        &self,
-        account_id: &str,
-    ) -> Result<CreateSubscriptionTokenOutput, ApiClientError> {
+    pub async fn create_subscription_token(&self) -> Result<CreateSubscriptionTokenOutput, ApiClientError> {
         match &self.inner {
             inner::Inner::Codewhisperer(client) => client
                 .create_subscription_token()
-                .account_id(account_id)
                 .send()
                 .await
                 .map_err(ApiClientError::CreateSubscriptionToken),
             inner::Inner::Mock => Ok(CreateSubscriptionTokenOutput::builder()
                 .set_encoded_verification_url(Some("test/url".to_string()))
+                .set_status(Some(SubscriptionStatus::Inactive))
+                .set_token(Some("test-token".to_string()))
                 .build()?),
-        }
-    }
-
-    #[allow(dead_code)] // TODO: Remove
-    pub async fn get_subscription_status(&self) -> Result<SubscriptionStatus, ApiClientError> {
-        match &self.inner {
-            inner::Inner::Codewhisperer(_) => Ok(self
-                .create_subscription_token(SUBSCRIPTION_STATUS_ACCOUNT_ID)
-                .await?
-                .status()
-                .clone()),
-            inner::Inner::Mock => Ok(SubscriptionStatus::Active),
         }
     }
 }

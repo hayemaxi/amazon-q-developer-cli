@@ -60,6 +60,7 @@ pub enum Command {
     },
     Mcp,
     Model,
+    Subscribe,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -841,6 +842,7 @@ impl Command {
                 },
                 "mcp" => Self::Mcp,
                 "model" => Self::Model,
+                "subscribe" => Self::Subscribe,
                 unknown_command => {
                     let looks_like_path = {
                         let after_slash_command_str = parts[1..].join(" ");
