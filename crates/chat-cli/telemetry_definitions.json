@@ -105,11 +105,6 @@
       "type": "int",
       "description": "The length of the files included as part of context management"
     },
-            {
-            "name": "codewhispererterminal_chatRequestLength",
-            "type": "int",
-            "description": "Number of characters in request"
-        },
     {
       "name": "codewhispererterminal_mcpServerInitFailureReason",
       "type": "string",
@@ -283,7 +278,6 @@
           { "type": "result" },
           { "type": "reason", "required": false },
           { "type": "amazonqConversationId" },
-          { "type": "codewhispererterminal_chatRequestLength" },
           { "type": "codewhispererterminal_contextFileLength", "required": false }
       ]
     }

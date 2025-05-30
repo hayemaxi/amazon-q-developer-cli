@@ -229,6 +229,8 @@ impl TelemetryThread {
         conversation_id: String,
         message_id: String,
         context_file_length: Option<usize>,
+        credential_start_url: Option<String>,
+        sso_region: Option<String>,
         result: TelemetryResult,
         reason: Option<String>,
     ) -> Result<(), TelemetryError> {
@@ -236,6 +238,8 @@ impl TelemetryThread {
             conversation_id,
             message_id,
             context_file_length,
+            credential_start_url,
+            sso_region,
             result,
             reason,
         }))?)
@@ -307,11 +311,12 @@ impl TelemetryThread {
         &self,
         conversation_id: String,
         context_file_length: Option<usize>,
-        message_request_length: Option<usize>,
+        credential_start_url: Option<String>,
+        sso_region: Option<String>,
         result: TelemetryResult,
         reason: Option<String>,
     ) -> Result<(), TelemetryError> {
-        Ok(self.send(Event::new(EventType::MessageResponseError { result, reason, conversation_id, context_file_length, message_request_length }))?)
+        Ok(self.send(Event::new(EventType::MessageResponseError { result, reason, conversation_id, context_file_length, credential_start_url, sso_region }))?)
     }
 }
 
